@@ -6,6 +6,7 @@
 # - Mapbox Geocoding(POI/교차로) + OSM 교차로 추론으로 정류장명 제안(선택)
 # - Mapbox Directions로 실도로 라우팅
 # - 노선 모드: ① 개별쌍(모든 조합) ② 단일 차량(연속 경로)
+# - 변경점: 중간 승차 지점을 보라색 마커로 표기
 # ---------------------------------------------------------
 
 import os, math, re
@@ -58,9 +59,9 @@ st.markdown(
 )
 
 # ===================== 토큰/상수 =====================
-MAPBOX_TOKEN = ""  # << 여기에 네 Mapbox 토큰을 넣어줘. (또는 환경변수/Secrets 사용)
+MAPBOX_TOKEN = ""  # << 여기에 네 Mapbox 토큰을 넣어줘.
 if not MAPBOX_TOKEN:
-    MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ")
+    MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
     try:
         MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
@@ -79,7 +80,6 @@ def haversine(xy1, xy2):
     return 2*R*np.arcsin(np.sqrt(a))
 
 def nearest_neighbor_order(coords: List[Tuple[float,float]], start_idx: int = 0) -> List[int]:
-    """coords에서 start_idx부터 최근접 탐욕으로 순서 반환(인덱스 리스트)."""
     n = len(coords)
     if n == 0: return []
     visited = [False]*n
@@ -99,7 +99,6 @@ def nearest_neighbor_order(coords: List[Tuple[float,float]], start_idx: int = 0)
     return order
 
 def _read_utf8_shp(path: Path) -> gpd.GeoDataFrame:
-    # shp UTF-8 강제
     try:
         from pyogrio import read_dataframe as pio
         g = pio(path, encoding="utf-8")
@@ -126,7 +125,6 @@ def _open_any() -> gpd.GeoDataFrame:
                     g = g.to_crs(epsg=4326)
             except Exception:
                 pass
-            # 포인트가 아니면 대표점으로 변환
             if not g.geom_type.astype(str).str.contains("Point",case=False,na=False).any():
                 g = g.copy(); g["geometry"]=g.geometry.representative_point()
             return g
@@ -139,11 +137,9 @@ def load_stops() -> gpd.GeoDataFrame:
         st.error("소스에 'jibun' 필드가 없습니다."); st.stop()
     g = g.copy()
     g["jibun"] = g["jibun"].astype(str).str.strip()
-    # 기본 이름 = 지번
     g["name"]  = g["jibun"]
     g["lon"]   = g.geometry.x; g["lat"]=g.geometry.y
     st.caption(f"데이터셋: {DATA_STEM} (포인트 {len(g)}개 · UTF-8 · 기본이름=지번)")
-    # 불필요한 NaN 제거
     g = g.dropna(subset=["lon","lat"])
     return g[["jibun","name","lon","lat","geometry"]]
 
@@ -290,7 +286,6 @@ with col1:
     route_mode = st.radio("노선 모드", ["개별쌍(모든 조합)","단일 차량(연속 경로)"], index=1)
     seq_order_mode = st.selectbox("순서 방식", ["가까운 우선(최근접)", "선택 순서 그대로"], index=0)
 
-    # ---- 정류장명 자동 제안 ----
     st.markdown('<div class="section-header">📝 정류장명 자동 제안</div>', unsafe_allow_html=True)
     gen_clicked   = st.button("선택 정류장에 대해 이름 제안 생성")
     apply_clicked = st.button("제안된 이름 일괄 적용")
@@ -337,7 +332,7 @@ with col3:
         if not starts and not ends:
             st.warning("이름을 제안할 정류장을 선택하세요(출발/도착 중 아무거나).")
         else:
-            sel = list(dict.fromkeys((starts or []) + (ends or [])))  # 중복 제거, 순서 유지
+            sel = list(dict.fromkeys((starts or []) + (ends or [])))
             suggested = []
             for nm in sel:
                 p = stops.loc[stops["name"]==nm].iloc[0]
@@ -372,11 +367,14 @@ with col3:
             else:
                 total_min, total_km = 0.0, 0.0
                 seg_idx = 0
+                first_start = starts[0] if starts else None
+                extra_pickups = set(starts[1:])  # 중간 승차지
+
                 for s_nm in starts:
-                    sxy = coord_of_name(s_nm); 
+                    sxy = coord_of_name(s_nm)
                     if not sxy: continue
                     for e_nm in ends:
-                        exy = coord_of_name(e_nm); 
+                        exy = coord_of_name(e_nm)
                         if not exy: continue
                         try:
                             coords, dur, dist = mapbox_route(sxy[0], sxy[1], exy[0], exy[1],
@@ -391,10 +389,14 @@ with col3:
                                                   f"color:#fff;border-radius:50%;width:26px;height:26px;"
                                                   f"line-height:26px;text-align:center;font-weight:700;'>{seg_idx+1}</div>")
                             ).add_to(m)
-                            folium.Marker([sxy[1], sxy[0]], icon=folium.Icon(color="red"),
+
+                            # ★ 중간 승차지=보라색, 최초 출발지=빨강
+                            start_color = "red" if s_nm == first_start else ("purple" if s_nm in extra_pickups else "red")
+                            folium.Marker([sxy[1], sxy[0]], icon=folium.Icon(color=start_color),
                                           tooltip=f"승차: {s_nm}").add_to(m)
                             folium.Marker([exy[1], exy[0]], icon=folium.Icon(color="blue"),
                                           tooltip=f"하차: {e_nm}").add_to(m)
+
                             total_min += dur/60; total_km += dist/1000; seg_idx += 1
                         except Exception as e:
                             st.warning(f"{s_nm}→{e_nm} Directions 실패: {e}")
@@ -411,7 +413,7 @@ with col3:
                 if not start_xy:
                     st.warning("출발지 좌표를 찾을 수 없습니다.")
                 else:
-                    # 다음 방문지 풀(중복 제거, 좌표 없는 항목 제거)
+                    # 다음 방문지(중간 승차 + 하차)
                     pool_names = list(dict.fromkeys(starts[1:] + ends))
                     pool_xy    = [coord_of_name(nm) for nm in pool_names]
                     pool_names = [nm for nm, xy in zip(pool_names, pool_xy) if xy]
@@ -422,21 +424,22 @@ with col3:
                     else:
                         # 순서 결정
                         if seq_order_mode == "선택 순서 그대로":
-                            order_idx = list(range(len(pool_xy)))   # 이미 출발지 제외 인덱스(0..)
+                            order_idx = list(range(len(pool_xy)))
                         else:
                             coords_all = [start_xy] + pool_xy
                             nn_order_coords = nearest_neighbor_order(coords_all, start_idx=0)
-                            # coords 기준 인덱스 → pool 기준 인덱스로 변환(출발지 0 제거 후 -1)
                             order_idx = [k - 1 for k in nn_order_coords if k != 0]
 
                         visit_names = [start_name] + [pool_names[i] for i in order_idx
                                                       if 0 <= i < len(pool_names)]
                         st.session_state["order"] = visit_names
 
-                        # 연속 구간 Directions 호출
+                        # 색 지정 기준
+                        mid_pickup_names = set(starts[1:])  # ★ 보라색 대상
                         total_min, total_km = 0.0, 0.0
                         seg_idx = 0
                         cur_xy = start_xy
+
                         for next_nm in visit_names[1:]:
                             nxt_xy = coord_of_name(next_nm)
                             if not nxt_xy:
@@ -449,12 +452,16 @@ with col3:
                                 ll = [(c[1], c[0]) for c in coords]
                                 folium.PolyLine(ll, color=PALETTE[seg_idx % len(PALETTE)],
                                                 weight=5, opacity=0.9).add_to(m)
-                                # 구간 시작/도착 핀
+
+                                # 구간 시작/도착 핀: 시작(빨강), 중간 승차(보라), 일반 도착(파랑)
                                 if seg_idx == 0:
                                     folium.Marker([cur_xy[1], cur_xy[0]], icon=folium.Icon(color="red"),
                                                   tooltip=f"출발: {start_name}").add_to(m)
-                                folium.Marker([nxt_xy[1], nxt_xy[0]], icon=folium.Icon(color="blue"),
-                                              tooltip=f"도착: {next_nm}").add_to(m)
+
+                                next_color = "purple" if next_nm in mid_pickup_names else "blue"
+                                next_tip   = f"중간 승차: {next_nm}" if next_nm in mid_pickup_names else f"도착: {next_nm}"
+                                folium.Marker([nxt_xy[1], nxt_xy[0]], icon=folium.Icon(color=next_color),
+                                              tooltip=next_tip).add_to(m)
 
                                 total_min += dur / 60
                                 total_km  += dist / 1000
@@ -467,3 +474,4 @@ with col3:
                         st.session_state["distance"] = total_km
 
     st_folium(m, height=560, returned_objects=[], use_container_width=True, key="main_map")
+
