@@ -1,15 +1,21 @@
-import os, math
+import os, math, requests
 import streamlit as st
 import geopandas as gpd
 import folium
 from shapely.geometry import LineString, MultiLineString
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="DRT 3·4 페르소나 경로", layout="wide")
+st.set_page_config(page_title="DRT 3·4 다중 승하차 최적 동선", layout="wide")
 
 # ─────────────────────────────────────
-# 0) 스샷 기반 정류장(순서/이름/페르소나) — 좌표는 없음
-#    ※ 필요하면 문자열만 수정하세요.
+# Mapbox 토큰: Secrets/환경변수/하드코딩(네가 준 값) 순
+# ─────────────────────────────────────
+MAPBOX_TOKEN = (st.secrets.get("MAPBOX_TOKEN", "") or os.getenv("MAPBOX_TOKEN", "")).strip()
+if not MAPBOX_TOKEN:
+    MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lZ2k1Y291MTdoZjJrb2k3bHc3cTJrbSJ9.DElgSQ0rPoRk1eEacPI8uQ"
+
+# ─────────────────────────────────────
+# 스샷 기반 정류장 목록(좌표 없음 → 라인상 보간)
 # ─────────────────────────────────────
 STOPDATA = {
     "3번버스": [
@@ -38,22 +44,14 @@ STOPDATA = {
     ],
 }
 
-# 페르소나 별 속도(시간 추정용). 필요 시 조정하세요.
-PERSONA_SPEED = {
-    "P1": 32,  # 교대 근로자
-    "P2": 30,  # 직장인/어르신
-    "P3": 28,  # 외래/수영회원
-    "P4": 24,  # 조깅러/성도
-    "P5": 26,  # 주민/복지
-    "P6": 25,  # 신도
-    "ALL": 28,
-}
+# 페르소나 속도(시간 추정, km/h) — 필요시 조정
+PERSONA_SPEED = {"P1":32, "P2":30, "P3":28, "P4":24, "P5":26, "P6":25, "ALL":28}
 
-# 노선 → shp 파일명 매핑 (레포 루트에 있어야 함)
+# 노선 → shp 파일명
 ROUTE_FILES = {"3번버스": "drt_3.shp", "4번버스": "drt_4.shp"}
 
 # ─────────────────────────────────────
-# 1) 지오메트리 로딩 + 라인 좌표(lat,lon)
+# Geo 유틸
 # ─────────────────────────────────────
 def load_route_latlon(route_name):
     shp = ROUTE_FILES[route_name]
@@ -67,7 +65,7 @@ def load_route_latlon(route_name):
     if not isinstance(geom, LineString):
         st.error("라인 형식이 올바르지 않습니다.")
         st.stop()
-    coords_lonlat = list(geom.coords)            # (lon,lat)
+    coords_lonlat = list(geom.coords)             # (lon,lat)
     coords_latlon = [(y, x) for (x, y) in coords_lonlat]
     return coords_latlon
 
@@ -79,35 +77,32 @@ def hav(lat1, lon1, lat2, lon2):
     h = sin(dy/2)**2 + cos(y1)*cos(y2)*sin(dx/2)**2
     return 2*R*asin(sqrt(h))
 
-def poly_length_m(coords):
+def poly_len_m(coords):
     return sum(hav(*coords[i], *coords[i+1]) for i in range(len(coords)-1))
 
-def cumulative_dist(coords):
-    """각 꼭짓점까지의 누적거리(m)"""
-    cum = [0.0]
+def cumulative(coords):
+    acc=[0.0]
     for i in range(len(coords)-1):
-        cum.append(cum[-1] + hav(*coords[i], *coords[i+1]))
-    return cum
+        acc.append(acc[-1] + hav(*coords[i], *coords[i+1]))
+    return acc
 
 def point_at_length(coords, cum, target):
-    """누적거리 target(m) 지점의 보간 좌표(lat,lon)"""
     if target <= 0: return coords[0]
     if target >= cum[-1]: return coords[-1]
     for i in range(1, len(cum)):
         if cum[i] >= target:
-            ratio = (target - cum[i-1]) / max(cum[i]-cum[i-1], 1e-9)
-            lat = coords[i-1][0] + ratio*(coords[i][0]-coords[i-1][0])
-            lon = coords[i-1][1] + ratio*(coords[i][1]-coords[i-1][1])
+            r = (target - cum[i-1]) / max(cum[i]-cum[i-1], 1e-9)
+            lat = coords[i-1][0] + r*(coords[i][0]-coords[i-1][0])
+            lon = coords[i-1][1] + r*(coords[i][1]-coords[i-1][1])
             return (lat, lon)
     return coords[-1]
 
-def seq_to_position(seq, N, total_m, coords, cum):
-    """정류장 seq(1..N)를 폴리라인의 균등 길이 비율로 매핑"""
+def seq_to_pos(seq, N, total_m, coords, cum):
     t = (seq-1)/max(N-1,1)
     return point_at_length(coords, cum, t*total_m)
 
 def extract_segment(coords, cum, a_m, b_m):
-    """누적거리 a~b 구간의 폴리라인을 추출"""
+    """누적거리 a~b 구간 폴리라인 (a<=b 순으로 반환)"""
     if a_m > b_m: a_m, b_m = b_m, a_m
     seg = [point_at_length(coords, cum, a_m)]
     for i in range(1, len(cum)-1):
@@ -117,105 +112,154 @@ def extract_segment(coords, cum, a_m, b_m):
     return seg
 
 # ─────────────────────────────────────
-# 2) UI
+# Mapbox Map Matching (도로 스냅)
 # ─────────────────────────────────────
-left, mid, right = st.columns([1.2, 1.0, 2.6], gap="large")
+def thin_coords(coords_latlon, max_pts=95):
+    if len(coords_latlon) <= max_pts: return coords_latlon
+    step = math.ceil(len(coords_latlon) / max_pts)
+    return coords_latlon[::step] + [coords_latlon[-1]]
+
+def map_match_path(coords_latlon):
+    if not MAPBOX_TOKEN:
+        return None
+    pts = thin_coords(coords_latlon, max_pts=95)
+    coord_str = ";".join([f"{lon:.6f},{lat:.6f}" for (lat,lon) in pts])  # lon,lat
+    url = f"https://api.mapbox.com/matching/v5/mapbox/driving/{coord_str}"
+    params = {"geometries":"geojson", "overview":"full", "tidy":"true", "access_token": MAPBOX_TOKEN}
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("matchings"): return None
+        coords = data["matchings"][0]["geometry"]["coordinates"]  # [ [lon,lat],... ]
+        return [(lat,lon) for (lon,lat) in coords]
+    except Exception:
+        return None
+
+# ─────────────────────────────────────
+# UI
+# ─────────────────────────────────────
+left, mid, right = st.columns([1.25, 1.0, 2.6], gap="large")
 
 with left:
-    st.subheader("① 노선/페르소나/승하차")
+    st.subheader("① 노선 · 선택옵션")
     route = st.selectbox("운행 노선", ["3번버스","4번버스"])
-    persona_pick = st.selectbox("페르소나", ["P3","P4","ALL"])
-    speed_kmh = PERSONA_SPEED.get(persona_pick, 28)
+    persona_filter = st.selectbox("페르소나 필터(선택)", ["ALL","P1","P2","P3","P4","P5","P6"])
+    speed_kmh = PERSONA_SPEED.get(persona_filter, 28)
+    match_to_roads = st.toggle("도로를 따라 그리기 (Map Matching)", value=True)
 
+    # 정류장 옵션 만들기(필터 적용)
     stops = STOPDATA[route]
-    N = len(stops)
+    def visible(s): return True if persona_filter=="ALL" else (persona_filter in s["personas"])
+    filtered = [s for s in stops if visible(s)] or stops
+    opt = [f"{s['seq']:02d}. {s['name']}" for s in filtered]
 
-    # 페르소나 필터(해당 페르소나 포함된 정류장 우선 표출)
-    def visible(s):
-        return True if persona_pick=="ALL" else (persona_pick in s["personas"])
+    st.subheader("② 승하차 정류장 선택")
+    picks = st.multiselect("승차 정류장(여러 개)", opt, default=opt[:1])
+    drops = st.multiselect("하차 정류장(여러 개)", opt, default=opt[-1:])
 
-    vis = [s for s in stops if visible(s)]
-    if len(vis) < 2:         # 너무 적으면 전체 보여주기
-        vis = stops
-
-    label = lambda s: f"{s['seq']:02d}. {s['name']}"
-    start = st.selectbox("출발 정류장", [label(s) for s in vis], index=0)
-    end   = st.selectbox("도착 정류장", [label(s) for s in vis], index=len(vis)-1)
-
-    start_seq = int(start.split(".")[0])
-    end_seq   = int(end.split(".")[0])
-
-    ride_time = st.time_input("승차 시간", value=None, help="입력 시 결과에 함께 표기됩니다.")
+    direction = st.radio("방향", ["자동(오름차순)", "오름차순", "내림차순"], horizontal=True, index=0)
     go = st.button("최적 동선 생성")
 
-# ─────────────────────────────────────
-# 3) 계산
-# ─────────────────────────────────────
+# 기본 데이터 준비
 coords = load_route_latlon(route)
-total_m = poly_length_m(coords)
-cum = cumulative_dist(coords)
+total_m = poly_len_m(coords)
+cum = cumulative(coords)
+N = len(stops)
+seq_xy = {s["seq"]: seq_to_pos(s["seq"], N, total_m, coords, cum) for s in stops}
 
-# 모든 정류장의 보간 좌표
-seq_xy = {s["seq"]: seq_to_position(s["seq"], N, total_m, coords, cum) for s in stops}
+# 선택된 시퀀스 집합
+def seq_of(label): return int(str(label).split(".")[0])
+selected_seqs = sorted({seq_of(v) for v in (picks + drops)})
 
 with mid:
-    st.subheader("② 결과 요약")
+    st.subheader("③ 결과 요약")
     if go:
-        # 선택 구간 길이/시간
-        a = (start_seq-1)/max(N-1,1) * total_m
-        b = (end_seq-1)/max(N-1,1) * total_m
-        seg_m = abs(b-a)
-        seg_km = seg_m / 1000.0
-        seg_min = (seg_km / max(speed_kmh, 1e-6)) * 60.0
+        if len(selected_seqs) == 0:
+            st.warning("정류장을 한 개 이상 선택하세요.")
+        elif len(selected_seqs) == 1:
+            st.metric("📏 이동거리", "0.00 km")
+            st.metric("⏱ 소요시간", "0.0 분")
+            st.info("선택 구간이 1곳이므로 이동이 없습니다.")
+        else:
+            # 방문 순서 정하기
+            if direction == "내림차순":
+                order = sorted(selected_seqs, reverse=True)
+            else:  # 자동/오름차순 → 오름차순
+                order = sorted(selected_seqs)
 
-        # 방문 순서(시퀀스 방향)
-        step = 1 if end_seq >= start_seq else -1
-        visit_names = [next(s["name"] for s in stops if s["seq"]==i) 
-                       for i in range(start_seq, end_seq+step, step)]
+            # 전체 경로 폴리라인 구성 (선택 구간들을 차례로 연결)
+            full_line = []
+            total_len_m = 0.0
+            for a, b in zip(order[:-1], order[1:]):
+                a_m = (a-1)/max(N-1,1) * total_m
+                b_m = (b-1)/max(N-1,1) * total_m
+                seg = extract_segment(coords, cum, a_m, b_m)
+                if a > b: seg = list(reversed(seg))        # 진행방향 정렬
+                if full_line and seg:
+                    if full_line[-1] == seg[0]: seg = seg[1:]
+                full_line += seg
 
-        st.markdown("**방문 순서**")
-        for i, nm in enumerate(visit_names, 1):
-            st.markdown(f"- {i}. {nm}")
+            # 도로 스냅
+            matched = map_match_path(full_line) if match_to_roads else None
+            line_for_calc = matched or full_line
+            total_len_m = poly_len_m(line_for_calc)
+            total_km = total_len_m / 1000.0
+            total_min = (total_km / max(speed_kmh, 1e-6)) * 60.0
 
-        st.metric("📏 이동거리", f"{seg_km:.2f} km")
-        st.metric("⏱ 소요시간", f"{seg_min:.1f} 분")
-        if ride_time:
-            st.caption(f"승차 시간: **{ride_time.strftime('%H:%M')}**")
+            # 방문 순서 출력
+            st.markdown("**방문 순서**")
+            for i, s in enumerate(order, 1):
+                nm = next(x["name"] for x in stops if x["seq"]==s)
+                tag = "승차" if s in {seq_of(v) for v in picks} else ("하차" if s in {seq_of(v) for v in drops} else "경유")
+                st.markdown(f"- {i}. {nm} ({tag})")
+
+            st.metric("📏 총 이동거리", f"{total_km:.2f} km")
+            st.metric("⏱ 예상 소요시간", f"{total_min:.1f} 분")
     else:
-        st.info("좌측에서 선택 후 **최적 동선 생성**을 눌러주세요.")
+        st.info("정류장들을 고른 뒤 **최적 동선 생성**을 눌러 주세요.")
 
-# ─────────────────────────────────────
-# 4) 지도
-# ─────────────────────────────────────
 with right:
-    st.subheader("③ 지도")
+    st.subheader("④ 지도")
     center = coords[len(coords)//2]
     m = folium.Map(location=center, zoom_start=13, tiles="CartoDB Positron")
 
     # 전체 노선
-    folium.PolyLine(coords, color="#356df3", weight=6, opacity=0.75, tooltip=f"{route}").add_to(m)
+    folium.PolyLine(coords, color="#356df3", weight=5, opacity=0.7, tooltip=f"{route}").add_to(m)
 
-    # 정류장 마커(페르소나 우선 강조)
+    # 모든 정류장 표시(필터 반영)
+    focus_set = set(selected_seqs)
     for s in stops:
         lat, lon = seq_xy[s["seq"]]
-        is_focus = (persona_pick=="ALL") or (persona_pick in s["personas"])
-        color = "#ff7043" if is_focus else "#9aa0a6"
-        folium.CircleMarker([lat,lon], radius=5, color=color, fill=True, fill_opacity=1.0,
-                            tooltip=f"{s['seq']}. {s['name']} ({'/'.join(s['personas'])})").add_to(m)
+        pick = s["seq"] in {seq_of(v) for v in picks}
+        drop = s["seq"] in {seq_of(v) for v in drops}
+        color = "#1e88e5"
+        if pick: color = "#43a047"   # 승차: green
+        if drop: color = "#e53935"   # 하차: red
+        radius = 6 if s["seq"] in focus_set else 4
+        folium.CircleMarker([lat,lon], radius=radius, color=color, fill=True, fill_opacity=1.0,
+                            tooltip=f"{s['seq']}. {s['name']}").add_to(m)
 
-    # 선택 구간 하이라이트
-    if go:
-        a = (start_seq-1)/max(N-1,1) * total_m
-        b = (end_seq-1)/max(N-1,1) * total_m
-        seg_line = extract_segment(coords, cum, a, b)
-        folium.PolyLine(seg_line, color="#00c853", weight=8, opacity=0.95,
-                        tooltip="선택 구간").add_to(m)
+    # 선택 경로 그리기
+    if go and len(selected_seqs) >= 2:
+        if direction == "내림차순":
+            order = sorted(selected_seqs, reverse=True)
+        else:
+            order = sorted(selected_seqs)
 
-        for seq, (lat,lon) in [(start_seq, seq_xy[start_seq]), (end_seq, seq_xy[end_seq])]:
-            nm = next(s["name"] for s in stops if s["seq"]==seq)
-            icon = "play" if seq==start_seq else "stop"
-            colr = "green" if seq==start_seq else "red"
-            folium.Marker([lat,lon], tooltip=f"{seq}. {nm}",
-                          icon=folium.Icon(color=colr, icon=icon)).add_to(m)
+        full_line = []
+        for a, b in zip(order[:-1], order[1:]):
+            a_m = (a-1)/max(N-1,1) * total_m
+            b_m = (b-1)/max(N-1,1) * total_m
+            seg = extract_segment(coords, cum, a_m, b_m)
+            if a > b: seg = list(reversed(seg))
+            if full_line and seg and full_line[-1]==seg[0]: seg = seg[1:]
+            full_line += seg
+
+        matched = map_match_path(full_line) if match_to_roads else None
+        draw_line = matched or full_line
+
+        folium.PolyLine(draw_line, color="#00c853", weight=8, opacity=0.95,
+                        tooltip="선택 구간(최적 동선)").add_to(m)
 
     st_folium(m, height=560, use_container_width=True)
