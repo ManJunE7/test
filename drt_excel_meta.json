@@ -1,0 +1,269 @@
+{
+  "1번버스": {
+    "1": {
+      "name": "천안아산역",
+      "time": "17:00:00",
+      "note": "동철 탑승",
+      "persona": "천안아산역",
+      "persona_code": ""
+    },
+    "2": {
+      "name": "천안역",
+      "time": "17:15:00",
+      "note": "영호 탑승",
+      "persona": "천안역",
+      "persona_code": ""
+    },
+    "3": {
+      "name": "상명대학교 천안캠퍼스",
+      "time": "17:30:00",
+      "note": "민지 탑승",
+      "persona": "상명대학교 천안캠퍼스",
+      "persona_code": ""
+    },
+    "4": {
+      "name": "이마트 천안터미널점",
+      "time": "18:00:00",
+      "note": "수현 탑승",
+      "persona": "이마트 천안터미널점",
+      "persona_code": ""
+    },
+    "5": {
+      "name": "천안북중학교",
+      "time": "18:30:00",
+      "note": "지훈 탑승",
+      "persona": "천안북중학교",
+      "persona_code": ""
+    },
+    "6": {
+      "name": "백석주공그린빌 2차 아파트",
+      "time": "19:00:00",
+      "note": "동철 하차",
+      "persona": "백석주공그린빌 2차 아파트",
+      "persona_code": ""
+    },
+    "7": {
+      "name": "거동빌라",
+      "time": "19:10:00",
+      "note": "영호 하차",
+      "persona": "거동빌라",
+      "persona_code": ""
+    },
+    "8": {
+      "name": "대우 목화 아파트",
+      "time": "19:15:00",
+      "note": "민지 하차",
+      "persona": "대우 목화 아파트",
+      "persona_code": ""
+    },
+    "9": {
+      "name": "천안주공6단지 1차 아파트",
+      "time": "19:30:00",
+      "note": "수현 하차",
+      "persona": "천안주공6단지 1차 아파트",
+      "persona_code": ""
+    }
+  },
+  "2번버스": {
+    "1": {
+      "name": "천안서당초등학교",
+      "time": "14:00:00",
+      "note": "예린 탑승",
+      "persona": "천안서당초등학교",
+      "persona_code": ""
+    },
+    "2": {
+      "name": "선율음악학원",
+      "time": "14:10:00",
+      "note": "예린 하차",
+      "persona": "선율음악학원",
+      "persona_code": ""
+    },
+    "3": {
+      "name": "천안시종합사회복지관",
+      "time": "15:30:00",
+      "note": "정호 탑승",
+      "persona": "천안시종합사회복지관",
+      "persona_code": ""
+    },
+    "4": {
+      "name": "천안우리병원",
+      "time": "15:35:00",
+      "note": "지수 탑승",
+      "persona": "천안우리병원",
+      "persona_code": ""
+    },
+    "5": {
+      "name": "쌍용도서관",
+      "time": "16:00:00",
+      "note": "소연 탑승",
+      "persona": "쌍용도서관",
+      "persona_code": ""
+    },
+    "6": {
+      "name": "쌍용주공7단지",
+      "time": "16:20:00",
+      "note": "소연 하차",
+      "persona": "쌍용주공7단지",
+      "persona_code": ""
+    },
+    "7": {
+      "name": "늘푸른공원",
+      "time": "16:40:00",
+      "note": "나영 탑승",
+      "persona": "늘푸른공원",
+      "persona_code": ""
+    },
+    "8": {
+      "name": "월봉청솔1차아파트",
+      "time": "16:50:00",
+      "note": "나영 하차",
+      "persona": "월봉청솔1차아파트",
+      "persona_code": ""
+    }
+  },
+  "3번버스": {
+    "1": {
+      "name": "우상단 아파트 (RED",
+      "time": "09:25:00",
+      "note": "승차",
+      "persona": "P3 수영회원",
+      "persona_code": "P3"
+    },
+    "2": {
+      "name": "북측 아파트 (RED",
+      "time": "09:33:00",
+      "note": "승차",
+      "persona": "P2 북측 어르신",
+      "persona_code": "P2"
+    },
+    "3": {
+      "name": "동측 국도변 빌라 (RED",
+      "time": "09:42:00",
+      "note": "승차",
+      "persona": "P1 교대 근로자",
+      "persona_code": "P1"
+    },
+    "4": {
+      "name": "산단 북문 환승존 → Gate 2 (GREEN",
+      "time": "09:52–09:56",
+      "note": "“10시쯤” 도착",
+      "persona": "P1 교대 근로자",
+      "persona_code": "P1"
+    },
+    "5": {
+      "name": "라이프타운 아파트 (RED",
+      "time": "10:02:00",
+      "note": "승차",
+      "persona": "P4 성도(교회)",
+      "persona_code": "P4"
+    },
+    "6": {
+      "name": "청수빌 (RED",
+      "time": "10:10:00",
+      "note": "승차",
+      "persona": "P5 복지관",
+      "persona_code": "P5"
+    },
+    "7": {
+      "name": "종합사회복지관 허브 (GREEN",
+      "time": "10:18:00",
+      "note": "목표 10:20 충족",
+      "persona": "P5 복지관",
+      "persona_code": "P5"
+    },
+    "8": {
+      "name": "중앙 허브 → 기업지원동 (GREEN",
+      "time": "10:27:00",
+      "note": "10:30 입장",
+      "persona": "P2 북측 어르신",
+      "persona_code": "P2"
+    },
+    "9": {
+      "name": "체육센터 허브(수영장) (GREEN",
+      "time": "10:38:00",
+      "note": "수영",
+      "persona": "P3 수영회원",
+      "persona_code": "P3"
+    },
+    "10": {
+      "name": "교회 앞 골목 허브 (GREEN",
+      "time": "10:48:00",
+      "note": "목표 10:50 충족",
+      "persona": "P4 성도(교회)",
+      "persona_code": "P4"
+    }
+  },
+  "4번버스": {
+    "1": {
+      "name": "봉명동 빌딩 앞 (RED",
+      "time": "09:00:00",
+      "note": "승차",
+      "persona": "P2 직장인",
+      "persona_code": "P2"
+    },
+    "2": {
+      "name": "상명대 인근 아파트 (RED",
+      "time": "09:10:00",
+      "note": "승차",
+      "persona": "P3 외래환자",
+      "persona_code": "P3"
+    },
+    "3": {
+      "name": "천안역 환승/출구 (GREEN",
+      "time": "09:20:00",
+      "note": "출근 완료",
+      "persona": "P2 직장인",
+      "persona_code": "P2"
+    },
+    "4": {
+      "name": "쌍용동 아파트 (RED",
+      "time": "09:25:00",
+      "note": "승차",
+      "persona": "P4 조깅러",
+      "persona_code": "P4"
+    },
+    "5": {
+      "name": "병원 정문/외래 접수 (GREEN",
+      "time": "09:35:00",
+      "note": "진료",
+      "persona": "P3 외래환자",
+      "persona_code": "P3"
+    },
+    "6": {
+      "name": "성정남부 주택가 (RED",
+      "time": "09:40:00",
+      "note": "승차",
+      "persona": "P5 주민",
+      "persona_code": "P5"
+    },
+    "7": {
+      "name": "도솔/쌍용공원 입구 (GREEN",
+      "time": "09:50:00",
+      "note": "운동",
+      "persona": "P4 조깅러",
+      "persona_code": "P4"
+    },
+    "8": {
+      "name": "남부도서관 인근 주거지 (RED",
+      "time": "10:00:00",
+      "note": "승차",
+      "persona": "P6 신도",
+      "persona_code": "P6"
+    },
+    "9": {
+      "name": "이마트 정문 (GREEN",
+      "time": "10:15:00",
+      "note": "장보기",
+      "persona": "P5 주민",
+      "persona_code": "P5"
+    },
+    "10": {
+      "name": "사찰/법당 앞 (GREEN",
+      "time": "10:30:00",
+      "note": "예불",
+      "persona": "P6 신도",
+      "persona_code": "P6"
+    }
+  }
+}
