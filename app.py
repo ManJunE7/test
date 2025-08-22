@@ -54,7 +54,7 @@ st.markdown(
 
 # ===================== 토큰 / 상수 =====================
 # 👉 여기 빈칸에 직접 넣어도 되고, 환경변수 MAPBOX_TOKEN 또는 st.secrets["MAPBOX_TOKEN"]로도 읽습니다.
-MAPBOX_TOKEN = ""  # << 여기 직접 넣거나, 환경변수/Secrets에 MAPBOX_TOKEN 설정
+MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # << 여기 직접 넣거나, 환경변수/Secrets에 MAPBOX_TOKEN 설정
 if not MAPBOX_TOKEN:
     MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
