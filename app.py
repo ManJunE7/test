@@ -1,301 +1,250 @@
+# app_cheonan_drt.py
+# ---------------------------------------------------------
+# 천안 DRT - 승/하차 다중 선택 → 실도로(Mapbox) 라우팅
+# ---------------------------------------------------------
 import streamlit as st
 import geopandas as gpd
 import pandas as pd
 import folium
-from folium.features import DivIcon
 from folium.plugins import MarkerCluster
+from folium.features import DivIcon
 from streamlit_folium import st_folium
-from shapely.geometry import Point, LineString, MultiLineString
+from shapely.geometry import Point
 from shapely.ops import unary_union
 from pathlib import Path
 import requests
 import math
 
-# ─────────────────────────────────────────────
-# 0) 기본 설정 & 토큰 (비워둠: st.secrets에서 읽음)
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="DRT 최적경로 추천 (Mapbox)", layout="wide")
-MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lZ2k1Y291MTdoZjJrb2k3bHc3cTJrbSJ9.DElgSQ0rPoRk1eEacPI8uQ")  # ← 네가 secrets.toml에 채워넣기
+# =========================
+# 0) 페이지/헤더
+# =========================
+APP_TITLE = "천안 DRT - 맞춤형 AI기반 스마트 교통 가이드"
+LOGO_URL  = "https://raw.githubusercontent.com/JeongWon4034/cheongju/main/cheongpung_logo.png"
 
-# ─────────────────────────────────────────────
-# 1) 유틸: 벡터 레이어 자동 로더
-#    - drt_1~drt_4: any of shp/geojson/gpkg
-#    - poi 레이어: 기본 cb_tour.shp (Point)
-# ─────────────────────────────────────────────
+st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="collapsed")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, sans-serif; }
+.header-container{display:flex;align-items:center;justify-content:center;gap:20px;margin-bottom:1.2rem;padding:0.6rem 0;}
+.logo-image{width:72px;height:72px;object-fit:contain}
+.main-title{font-size:2.1rem;font-weight:800;color:#202124;letter-spacing:-0.5px;margin:0}
+.title-underline{width:100%;height:3px;background:linear-gradient(90deg,#4285f4,#34a853);margin:0 auto 1rem;border-radius:2px;}
+.section-header{font-size:1.05rem;font-weight:800;color:#1f2937;margin-bottom:10px;padding-bottom:8px;border-bottom:2px solid #f3f4f6}
+.stButton > button{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;border-radius:10px;padding:10px 18px;font-size:.9rem;font-weight:700;box-shadow:0 4px 8px rgba(102,126,234,.3)}
+.stButton > button:hover{transform:translateY(-1px);box-shadow:0 6px 14px rgba(102,126,234,.4)}
+.visit-card{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border-radius:12px;padding:10px 12px;margin-bottom:8px;box-shadow:0 2px 4px rgba(102,126,234,.3)}
+.visit-num{background:#fff;color:#667eea;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.8rem}
+.empty{color:#9ca3af;background:linear-gradient(135deg,#ffecd2 0%,#fcb69f 100%);border-radius:12px;padding:22px 14px;text-align:center}
+.map-box{width:100%;height:560px;border-radius:12px;overflow:hidden;border:2px solid #e5e7eb}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    f"""
+    <div class="header-container">
+        <img src="{LOGO_URL}" alt="앱 로고" class="logo-image" />
+        <div class="main-title">{APP_TITLE}</div>
+    </div>
+    <div class="title-underline"></div>
+    """,
+    unsafe_allow_html=True
+)
+
+# =========================
+# 1) 토큰/기본 상수
+# =========================
+MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lZ2k1Y291MTdoZjJrb2k3bHc3cTJrbSJ9.DElgSQ0rPoRk1eEacPI8uQ")  # ← 여기에 secrets.toml로 넣어줘야 함
+PALETTE = ["#4285f4","#34a853","#ea4335","#fbbc04","#7e57c2","#26a69a","#ef6c00","#c2185b"]
+
+# =========================
+# 2) 데이터 로더
+#    - 정류장(POINT)과 경계(선택) 자동 탐색
+# =========================
 def _read_vector_any(basename: str):
-    """basename(확장자 없이)로 shp/geojson/gpkg 탐색 후 첫 성공 레이어 리턴"""
     base = Path(".")
-    patterns = [f"{basename}.shp", f"{basename}.geojson", f"{basename}.gpkg", f"{basename}.json"]
-    for pat in patterns:
+    for pat in (f"{basename}.shp", f"{basename}.geojson", f"{basename}.gpkg", f"{basename}.json"):
         for p in base.glob(f"**/{pat}"):
             try:
-                gdf = gpd.read_file(p)
-                return gdf
+                return gpd.read_file(p)
             except Exception:
-                continue
+                pass
     return None
 
 @st.cache_data
-def load_poi_layer():
-    gdf = None
-    # 프로젝트에 맞게 파일명 바꿔도 됨
-    for name in ["cb_tour", "poi", "stops", "points"]:
-        gdf = _read_vector_any(name)
-        if gdf is not None:
+def load_stops():
+    # 네 환경에 맞게 파일명/우선순위 추가 가능
+    for nm in ["cb_tour","stops","poi","bus_stops","drt_points"]:
+        g = _read_vector_any(nm)
+        if g is not None:
             break
-    if gdf is None:
-        st.error("POI(Point) 레이어를 찾지 못했습니다. 예: cb_tour.shp")
+    if g is None:
+        st.error("정류장(POINT) 레이어를 찾지 못했습니다. 예: cb_tour.shp")
         st.stop()
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=4326)
-    else:
-        gdf = gdf.to_crs(epsg=4326)
-    # lon/lat 컬럼 보장
-    if "lon" not in gdf.columns or "lat" not in gdf.columns:
-        gdf["lon"] = gdf.geometry.x
-        gdf["lat"] = gdf.geometry.y
+    g = g.to_crs(epsg=4326) if g.crs else g.set_crs(epsg=4326)
+    g["lon"] = g.geometry.x
+    g["lat"] = g.geometry.y
     # 이름 컬럼 추정
     name_col = None
-    for c in ["name", "Name", "NAME", "title", "station", "st_name"]:
-        if c in gdf.columns:
-            name_col = c
-            break
+    for c in ["name","NAME","Name","정류장명","station","st_name","title"]:
+        if c in g.columns:
+            name_col = c; break
     if name_col is None:
-        name_col = gdf.columns[0]  # 첫 컬럼을 이름처럼 사용 (원하면 바꿔도 됨)
-    return gdf[[name_col, "lon", "lat", "geometry"]].rename(columns={name_col: "name"})
+        name_col = g.columns[0]
+    g = g.rename(columns={name_col:"name"})
+    return g[["name","lon","lat","geometry"]]
 
 @st.cache_data
-def load_drt_lines():
-    drt = {}
-    for i in range(1, 5):
-        g = _read_vector_any(f"drt_{i}")
-        if g is None:
-            continue
-        if g.crs is None:
-            g = g.set_crs(epsg=4326)
-        else:
-            g = g.to_crs(epsg=4326)
-        # 전체 라인 합치기
-        geom = unary_union(g.geometry)
-        if isinstance(geom, (LineString, MultiLineString)):
-            drt[f"drt_{i}"] = geom
-    return drt  # dict: {"drt_1": Line/MultiLine, ...}
-
-# ─────────────────────────────────────────────
-# 2) Mapbox Directions (실도로 라우팅)
-# ─────────────────────────────────────────────
-def mapbox_directions(lon1, lat1, lon2, lat2, profile="driving", token="", timeout=12):
-    if not token:
-        raise RuntimeError("MAPBOX_TOKEN이 설정되지 않았습니다. secrets.toml에 추가하세요.")
-    url = f"https://api.mapbox.com/directions/v5/mapbox/{profile}/{lon1},{lat1};{lon2},{lat2}"
-    params = {
-        "geometries": "geojson",
-        "overview": "full",
-        "access_token": token
-    }
-    r = requests.get(url, params=params, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"Mapbox API 오류: {r.status_code} - {r.text[:180]}")
-    j = r.json()
-    routes = j.get("routes", [])
-    if not routes:
-        raise RuntimeError("Mapbox: 경로가 반환되지 않았습니다.")
-    route = routes[0]
-    coords = route["geometry"]["coordinates"]   # [[lon,lat], ...]
-    duration = float(route.get("duration", 0.0))  # sec
-    distance = float(route.get("distance", 0.0))  # m
-    return coords, duration, distance
-
-# ─────────────────────────────────────────────
-# 3) 라우팅 결과를 DRT 라인과 매칭 (가까움 점수)
-#    - 경로 좌표(경위도)를 일정 간격 샘플링 → 각 점과 라인의 거리 평균
-#    - 거리는 투영좌표(UTM)로 변환 후 meter 단위 산출
-# ─────────────────────────────────────────────
-def route_drt_closeness_score(route_lonlat, drt_geom):
-    """route_lonlat: [[lon,lat], ...], drt_geom: LineString/MultiLineString
-       return: 평균거리(m) (낮을수록 '해당 DRT 라인과 가깝게 다닌다')"""
-    if not route_lonlat:
-        return float("inf")
-    # GeoDataFrame으로 만들고 로컬 투영 좌표계로 변환 (UTM 자동 추정)
-    r_gdf = gpd.GeoDataFrame(
-        geometry=[Point(lon, lat) for lon, lat in route_lonlat],
-        crs="EPSG:4326"
-    )
-    try:
-        local_crs = r_gdf.estimate_utm_crs()
-    except Exception:
-        local_crs = "EPSG:32652"  # Korea 대략(Zone 52N), 필요시 조정
-    r_xy = r_gdf.to_crs(local_crs)
-    d_xy = gpd.GeoSeries([drt_geom], crs="EPSG:4326").to_crs(local_crs).iloc[0]
-    # 모든 샘플 점에 대해 선까지의 거리(m) 평균
-    dists = [pt.distance(d_xy) for pt in r_xy.geometry]
-    return float(sum(dists) / len(dists))
-
-def recommend_drt(route_lonlat, drt_dict):
-    if not drt_dict:
-        return None, {}
-    scores = {}
-    for k, geom in drt_dict.items():
-        try:
-            scores[k] = route_drt_closeness_score(route_lonlat, geom)
-        except Exception:
-            scores[k] = float("inf")
-    # 최소 점수 = 가장 가까운 라인
-    best = min(scores, key=scores.get)
-    return best, scores
-
-# ─────────────────────────────────────────────
-# 4) 데이터 로드
-# ─────────────────────────────────────────────
-poi = load_poi_layer()
-drt_lines = load_drt_lines()  # {"drt_1": geom, ...}
-
-# 중심점 추정
-try:
-    c_lat = poi["lat"].astype(float).mean()
-    c_lon = poi["lon"].astype(float).mean()
-    if math.isnan(c_lat) or math.isnan(c_lon):
-        raise ValueError
-except Exception:
-    c_lat, c_lon = 36.80, 127.15  # 충청권 대략값
-
-# ─────────────────────────────────────────────
-# 5) UI
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.header("옵션")
-    profile = st.radio("이동 모드 (Mapbox)", ["driving", "walking"], horizontal=True)
-    pairing = st.radio("매칭 방식", ["인덱스 쌍 매칭 (1:1)", "모든 조합"], index=0)
-    max_routes = st.slider("최대 경로 수 제한", 1, 100, 20)
-    run = st.button("경로 생성")
-
-st.markdown("### 출발지 / 도착지 선택")
-cols = st.columns(2)
-with cols[0]:
-    start_names = st.multiselect("출발지(여러 개 선택 가능)", poi["name"].tolist())
-with cols[1]:
-    end_names   = st.multiselect("도착지(여러 개 선택 가능)", poi["name"].tolist())
-
-# ─────────────────────────────────────────────
-# 6) 지도
-# ─────────────────────────────────────────────
-m = folium.Map(location=[c_lat, c_lon], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
-
-# POI 표시
-mc = MarkerCluster().add_to(m)
-for _, r in poi.iterrows():
-    folium.Marker([r["lat"], r["lon"]], icon=folium.Icon(color="gray"), tooltip=str(r["name"])).add_to(mc)
-
-# DRT 라인 표시
-palette_drt = {"drt_1":"#9c27b0", "drt_2":"#00bcd4", "drt_3":"#8bc34a", "drt_4":"#ff9800"}
-for k, geom in drt_lines.items():
-    if isinstance(geom, LineString):
-        segs = [geom.coords[:]]
-    elif isinstance(geom, MultiLineString):
-        segs = [list(ls.coords) for ls in geom.geoms]
-    else:
-        segs = []
-    for seg in segs:
-        folium.PolyLine([(lat, lon) for lon, lat in seg], color=palette_drt.get(k, "#555"), weight=3, opacity=0.6).add_to(m)
-
-# ─────────────────────────────────────────────
-# 7) 경로 생성
-# ─────────────────────────────────────────────
-results = []
-route_palette = ["#4285f4", "#34a853", "#ea4335", "#fbbc04", "#7e57c2", "#26a69a", "#ef6c00", "#c2185b"]
-
-def name_to_xy(name):
-    row = poi.loc[poi["name"] == name]
-    if row.empty:
+def load_boundary():
+    b = _read_vector_any("cb_shp")
+    if b is None:
         return None
-    r = row.iloc[0]
-    return float(r["lon"]), float(r["lat"])
+    return b.to_crs(epsg=4326) if b.crs else b.set_crs(epsg=4326)
 
-if run:
-    if not MAPBOX_TOKEN:
-        st.error("MAPBOX_TOKEN이 없습니다. secrets.toml에 추가하세요.")
-    elif not start_names or not end_names:
-        st.warning("출발지와 도착지를 각각 1개 이상 선택하세요.")
+stops = load_stops()
+boundary = load_boundary()
+
+# 중심점
+try:
+    ctr_lat = float(stops["lat"].mean()); ctr_lon = float(stops["lon"].mean())
+    if math.isnan(ctr_lat) or math.isnan(ctr_lon): raise ValueError
+except:
+    ctr_lat, ctr_lon = 36.80, 127.15
+
+# =========================
+# 3) 레이아웃
+# =========================
+col1, col2, col3 = st.columns([1.6,1.2,3.2], gap="large")
+
+# ---------- 좌측: 설정 ----------
+with col1:
+    st.markdown('<div class="section-header">🚏 DRT 노선 추천 설정</div>', unsafe_allow_html=True)
+    mode = st.radio("운행 모드", ["차량(운행)","도보(승객 접근)"], horizontal=True)
+    profile = "driving" if mode.startswith("차량") else "walking"
+
+    st.markdown("**출발(승차) 정류장**")
+    starts = st.multiselect("", stops["name"].tolist(), key="starts", label_visibility="collapsed")
+
+    st.markdown("**도착(하차) 정류장**")
+    ends   = st.multiselect("", stops["name"].tolist(), key="ends", label_visibility="collapsed")
+
+    pairing = st.selectbox("매칭 방식", ["인덱스 쌍(1:1)", "모든 조합"], index=0)
+    max_routes = st.slider("최대 생성 경로 수(과금 보호)", 1, 100, 20)
+
+    cA, cB = st.columns(2)
+    run_clicked   = cA.button("노선 추천")
+    clear_clicked = cB.button("초기화")
+
+    if clear_clicked:
+        for k in ["segments","order","duration","distance","_pairs","_latlon"]:
+            st.session_state.pop(k, None)
+        st.experimental_rerun()
+
+# ---------- 중간: 방문 순서/메트릭 ----------
+with col2:
+    st.markdown('<div class="section-header">📍 여행 방문 순서</div>', unsafe_allow_html=True)
+    order_list = st.session_state.get("order", [])
+    if order_list:
+        for i, nm in enumerate(order_list, 1):
+            st.markdown(f'<div class="visit-card"><div class="visit-num">{i}</div><div>{nm}</div></div>', unsafe_allow_html=True)
     else:
-        # 매칭 목록 구성
-        od_pairs = []
-        if pairing.startswith("인덱스"):
-            n = min(len(start_names), len(end_names))
-            for i in range(n):
-                od_pairs.append((start_names[i], end_names[i]))
-        else:  # 모든 조합
-            for s in start_names:
-                for e in end_names:
-                    od_pairs.append((s, e))
-        if len(od_pairs) > max_routes:
-            st.info(f"경로가 {len(od_pairs)}건입니다. 상한 {max_routes}개만 처리합니다.")
-            od_pairs = od_pairs[:max_routes]
+        st.markdown('<div class="empty">경로 생성 후 표시됩니다</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    st.metric("⏱️ 소요시간", f"{st.session_state.get('duration',0.0):.1f}분")
+    st.metric("📏 이동거리", f"{st.session_state.get('distance',0.0):.2f}km")
 
-        # 각 경로 계산 & 표시
-        all_bounds = []
-        for idx, (s_name, e_name) in enumerate(od_pairs):
-            s_xy = name_to_xy(s_name)
-            e_xy = name_to_xy(e_name)
-            if s_xy is None or e_xy is None:
-                st.warning(f"좌표를 찾을 수 없음: {s_name} → {e_name}")
-                continue
-            try:
-                coords, dur, dist = mapbox_directions(s_xy[0], s_xy[1], e_xy[0], e_xy[1],
-                                                      profile=profile, token=MAPBOX_TOKEN)
-            except Exception as e:
-                st.warning(f"Mapbox 실패: {s_name} → {e_name} / {e}")
-                continue
+# ---------- 우측: 지도 ----------
+with col3:
+    st.markdown('<div class="section-header">🗺️ 추천경로 지도시각화</div>', unsafe_allow_html=True)
+    m = folium.Map(location=[ctr_lat, ctr_lon], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
 
-            # 추천 DRT 계산
-            best_drt, drt_scores = recommend_drt(coords, drt_lines)
+    if boundary is not None:
+        folium.GeoJson(boundary, style_function=lambda f: {"color":"#9aa0a6","weight":2,"dashArray":"4,4","fillOpacity":0.05}).add_to(m)
 
-            # 선 그리기
-            color = route_palette[idx % len(route_palette)]
-            latlon = [(c[1], c[0]) for c in coords]
-            folium.PolyLine(latlon, color=color, weight=5, opacity=0.85).add_to(m)
-            # 중간 라벨
-            mid = latlon[len(latlon)//2]
-            label = f"{idx+1}"
-            if best_drt:
-                label += f" · {best_drt}"
-            folium.map.Marker(mid, icon=DivIcon(html=f"<div style='background:{color};color:#fff;"
-                                                     "border-radius:50%;width:26px;height:26px;line-height:26px;"
-                                                     "text-align:center;font-weight:700;'>{label}</div>")).add_to(m)
-            # 시작/끝 마커
-            folium.Marker([s_xy[1], s_xy[0]], icon=folium.Icon(color="red"), tooltip=f"Start: {s_name}").add_to(m)
-            folium.Marker([e_xy[1], e_xy[0]], icon=folium.Icon(color="blue"), tooltip=f"End: {e_name}").add_to(m)
+    mc = MarkerCluster().add_to(m)
+    for _, r in stops.iterrows():
+        folium.Marker([r["lat"], r["lon"]], tooltip=str(r["name"]), icon=folium.Icon(color="gray")).add_to(mc)
 
-            # bounds 수집
-            all_bounds += latlon
+    # Mapbox 호출 함수
+    def mapbox_route(lon1, lat1, lon2, lat2, profile="driving", token="", timeout=12):
+        if not token:
+            raise RuntimeError("MAPBOX_TOKEN이 없습니다. secrets.toml에 설정하세요.")
+        url = f"https://api.mapbox.com/directions/v5/mapbox/{profile}/{lon1},{lat1};{lon2},{lat2}"
+        params = {"geometries":"geojson","overview":"full","access_token":token}
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"Mapbox 오류 {r.status_code}: {r.text[:160]}")
+        j = r.json()
+        if not j.get("routes"):
+            raise RuntimeError("경로가 반환되지 않았습니다.")
+        rt = j["routes"][0]
+        return rt["geometry"]["coordinates"], float(rt.get("duration",0.0)), float(rt.get("distance",0.0))
 
-            # 결과 테이블용
-            row = {
-                "idx": idx+1,
-                "start": s_name,
-                "end": e_name,
-                "profile": profile,
-                "duration_min": round(dur/60, 1),
-                "distance_km": round(dist/1000, 2),
-                "recommend_drt": best_drt if best_drt else "-"
-            }
-            # 상위 4개 점수만 덧붙임
-            for k in ["drt_1","drt_2","drt_3","drt_4"]:
-                if k in drt_lines and k in (drt_scores or {}):
-                    row[f"{k}_near_m"] = round(drt_scores[k], 1)
-            results.append(row)
+    # 이름→좌표
+    def xy(name: str):
+        s = stops.loc[stops["name"]==name]
+        if s.empty: return None
+        r = s.iloc[0]
+        return float(r["lon"]), float(r["lat"])
 
-        # fit bounds
-        if all_bounds:
-            m.fit_bounds([
-                [min(p[0] for p in all_bounds), min(p[1] for p in all_bounds)],
-                [max(p[0] for p in all_bounds), max(p[1] for p in all_bounds)],
-            ])
+    # 실행
+    if run_clicked:
+        if not starts or not ends:
+            st.warning("출발/도착 정류장을 각각 1개 이상 선택하세요.")
+        elif not MAPBOX_TOKEN:
+            st.error("MAPBOX_TOKEN이 없습니다. secrets.toml에 추가하세요.")
+        else:
+            # 매칭 목록 구성
+            pairs = []
+            if pairing.startswith("인덱스"):
+                n = min(len(starts), len(ends))
+                for i in range(n):
+                    pairs.append((starts[i], ends[i]))
+            else:  # 모든 조합
+                for s in starts:
+                    for e in ends:
+                        pairs.append((s, e))
+            if len(pairs) > max_routes:
+                st.info(f"요청 경로 {len(pairs)}건 중 {max_routes}건만 생성합니다.")
+                pairs = pairs[:max_routes]
 
-# 지도 출력
-st_folium(m, width="100%", height=600, returned_objects=[], use_container_width=True)
+            segs, total_sec, total_m, latlon_all = [], 0.0, 0.0, []
+            order_names = []
+            for i, (S, E) in enumerate(pairs):
+                sxy, exy = xy(S), xy(E)
+                if sxy is None or exy is None:
+                    st.warning(f"좌표 없음: {S} → {E}")
+                    continue
+                try:
+                    coords, dur, dist = mapbox_route(sxy[0], sxy[1], exy[0], exy[1], profile=profile, token=MAPBOX_TOKEN)
+                    segs.append(coords); total_sec += dur; total_m += dist
+                    ll = [(c[1], c[0]) for c in coords]
+                    folium.PolyLine(ll, color=PALETTE[i % len(PALETTE)], weight=5, opacity=0.85).add_to(m)
+                    # 라벨(중간점)
+                    mid = ll[len(ll)//2]
+                    folium.map.Marker(mid, icon=DivIcon(html=f"<div style='background:{PALETTE[i%len(PALETTE)]};color:#fff;border-radius:50%;width:26px;height:26px;line-height:26px;text-align:center;font-weight:700;'>{i+1}</div>")).add_to(m)
+                    # 시작/끝 마커
+                    folium.Marker([sxy[1], sxy[0]], icon=folium.Icon(color="red"), tooltip=f"승차: {S}").add_to(m)
+                    folium.Marker([exy[1], exy[0]], icon=folium.Icon(color="blue"), tooltip=f"하차: {E}").add_to(m)
+                    latlon_all += ll
+                    order_names += [f"{S} → {E}"]
+                except Exception as e:
+                    st.warning(f"{S} → {E} 실패: {e}")
 
-# 결과 테이블
-if results:
-    st.markdown("### 경로 요약")
-    df = pd.DataFrame(results)
-    st.dataframe(df, use_container_width=True)
+            # 상태 저장 + 메트릭
+            if segs:
+                st.session_state["segments"] = segs
+                st.session_state["order"]    = order_names
+                st.session_state["duration"] = total_sec/60
+                st.session_state["distance"] = total_m/1000
+                # fit bounds
+                if latlon_all:
+                    m.fit_bounds([[min(y for y,x in latlon_all), min(x for y,x in latlon_all)],
+                                  [max(y for y,x in latlon_all), max(x for y,x in latlon_all)]])
+                st.success("✅ 노선이 생성되었습니다!")
+
+    # 지도 렌더
+    st.markdown('<div class="map-box">', unsafe_allow_html=True)
+    st_folium(m, width="100%", height=560, returned_objects=[], use_container_width=True, key="main_map")
+    st.markdown('</div>', unsafe_allow_html=True)
