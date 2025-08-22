@@ -2,6 +2,7 @@
 # ---------------------------------------------------------
 # 천안 DRT - Matrix로 상위 N개만 Directions 호출(과금보호)
 # + 역지오코딩으로 "천안 이마트(마트)" 등 보기 좋은 라벨 표시
+# + ff_drt_dh.shp 내부 bus_stops 포인트 자동 탐지(타입 견고)
 # ---------------------------------------------------------
 import os
 import math
@@ -53,7 +54,7 @@ st.markdown(
 
 # ===================== 토큰 / 상수 =====================
 # 👉 여기 빈칸에 직접 넣어도 되고, 환경변수 MAPBOX_TOKEN 또는 st.secrets["MAPBOX_TOKEN"]로도 읽습니다.
-MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # << 네 토큰 문자열을 넣어도 됨
+MAPBOX_TOKEN = ""  # << 여기 직접 넣거나, 환경변수/Secrets에 MAPBOX_TOKEN 설정
 if not MAPBOX_TOKEN:
     MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
@@ -63,7 +64,7 @@ if not MAPBOX_TOKEN:
         pass
 
 PALETTE = ["#4285f4","#34a853","#ea4335","#fbbc04","#7e57c2","#26a69a","#ef6c00","#c2185b"]
-MATRIX_MAX_COORDS = 25  # Matrix에는 총 좌표 수 제한을 두는 게 안전
+MATRIX_MAX_COORDS = 25  # Matrix는 sources+destinations 총합이 너무 크면 비추천
 
 # ===================== 좌표계 보정 유틸 =====================
 KOREA_CRS_CANDIDATES = ["EPSG:5179","EPSG:5181","EPSG:5186","EPSG:5187","EPSG:2097","EPSG:32651","EPSG:32652","EPSG:32653"]
@@ -108,30 +109,53 @@ def load_stops():
     """
     ff_drt_dh.shp 안의 bus_stops 포인트를 우선 사용.
     없으면 이름이 그럴듯한 포인트 레이어를 탐색.
+    (문제였던 .strip() → .str.strip()으로 수정, 타입별 견고 처리)
     """
     ff = _find_first("ff_drt_dh.shp")
     g = None
+
     if ff:
         g0 = gpd.read_file(ff)
+
+        # 1) bus_stops 컬럼 우선 사용 (bool/수치/문자 모두 처리)
         use = None
-        # 1) 'bus_stops' 컬럼 필터
-        cand = [c for c in g0.columns if c.lower()=="bus_stops"]
-        if cand:
-            c = cand[0]
-            use = g0[g0[c].astype(str).strip().str.lower().isin(["1","true","y","yes","bus_stops"])]
-        # 2) 분류 컬럼에서 bus stop 문자열 탐색
+        cand_cols = [c for c in g0.columns if c.lower() == "bus_stops"]
+        if cand_cols:
+            c = cand_cols[0]
+            s = g0[c]
+
+            if pd.api.types.is_bool_dtype(s):
+                mask = s.fillna(False)
+            elif pd.api.types.is_numeric_dtype(s):
+                mask = s.fillna(0).astype(float) > 0
+            else:
+                mask = s.astype(str).str.strip().str.lower().isin(
+                    ["1","true","y","yes","t","on","bus_stops","ok"]
+                )
+            use = g0[mask]
+
+        # 2) 분류/레이어 컬럼에서 bus stop 문자열 탐색
         if use is None or use.empty:
-            cat_cols = [c for c in g0.columns if c.lower() in ("layer","type","category","class","feature","theme","kind","group","분류","구분","시설구분")]
+            cat_cols = [c for c in g0.columns if c.lower() in (
+                "layer","type","category","class","feature","theme","kind","group","분류","구분","시설구분"
+            )]
             for c in cat_cols:
                 m = g0[c].astype(str).str.lower().str.contains(r"bus[\s_\-]*stop", na=False)
-                if m.any(): use = g0[m]; break
+                if m.any():
+                    use = g0[m]
+                    break
+
         # 3) 최후: 포인트만 추출
         if use is None or use.empty:
             use = g0[g0.geom_type.astype(str).str.contains("Point", case=False, na=False)]
+
         if use.empty:
-            st.error("ff_drt_dh.shp에서 bus_stops 포인트를 찾지 못했습니다."); st.stop()
+            st.error("ff_drt_dh.shp에서 bus_stops 포인트를 찾지 못했습니다.")
+            st.stop()
+
         g = to_wgs84_auto(use)
 
+    # 백업: 다른 포인트 후보 파일 검색
     if g is None:
         candidates = []
         for bn in ["cb_tour","stops","poi","bus_stops","drt_points"]:
@@ -143,22 +167,31 @@ def load_stops():
             try:
                 g0 = gpd.read_file(p)
                 pts = g0[g0.geom_type.astype(str).str.contains("Point", case=False, na=False)]
-                if pts.empty: continue
-                g = to_wgs84_auto(pts); break
-            except: continue
+                if pts.empty:
+                    continue
+                g = to_wgs84_auto(pts)
+                break
+            except:
+                continue
 
     if g is None or g.empty:
-        st.error("정류장(POINT) 레이어를 찾지 못했습니다."); st.stop()
+        st.error("정류장(POINT) 레이어를 찾지 못했습니다.")
+        st.stop()
 
     name_col = _pick_name_col(g)
     if name_col is None:
         g["name"] = [f"정류장_{i+1}" for i in range(len(g))]
         name_col = "name"
-    g = g.rename(columns={name_col:"name"})
+
+    g = g.rename(columns={name_col: "name"})
     g["lon"], g["lat"] = g.geometry.x, g.geometry.y
-    if not ((g["lon"].between(-180,180)) & (g["lat"].between(-90,90))).all():
-        st.error("좌표 변환 실패(경위도 범위 벗어남). 원본 CRS 확인 필요."); st.stop()
-    return g[["name","lon","lat","geometry"]]
+
+    # 좌표 sanity check
+    if not ((g["lon"].between(-180, 180)) & (g["lat"].between(-90, 90))).all():
+        st.error("좌표 변환 실패(경위도 범위 벗어남). 원본 CRS 확인 필요.")
+        st.stop()
+
+    return g[["name", "lon", "lat", "geometry"]]
 
 @st.cache_data
 def load_boundary():
@@ -361,6 +394,7 @@ with col3:
                             pairs_to_draw = [(i,j) for _,_,i,j in scored[:top_k]]
                         except Exception as e:
                             st.warning(f"Matrix 오류로 근사 정렬 사용: {e}")
+                            # 허버사인 거리로 상위 N개 근사 선택
                             def hav(xy1, xy2):
                                 R=6371000.0
                                 lon1,lat1,lon2,lat2 = map(np.radians,[xy1[0],xy1[1],xy2[0],xy2[1]])
@@ -396,16 +430,17 @@ with col3:
                     except Exception as e:
                         st.warning(f"{S}→{E} Directions 실패: {e}")
 
+                # 방문 순서/메트릭 업데이트
                 st.session_state["order"]    = []
                 for (si,dj) in pairs_to_draw:
                     sxy, exy = src_xy[si], dst_xy[dj]
                     s_label, _ = mapbox_reverse_name_pretty(sxy[0], sxy[1], token=MAPBOX_TOKEN)
                     e_label, _ = mapbox_reverse_name_pretty(exy[0], exy[1], token=MAPBOX_TOKEN)
                     st.session_state["order"].append(f"{s_label or starts[si]} → {e_label or ends[dj]}")
-
                 st.session_state["duration"] = total_min
                 st.session_state["distance"] = total_km
 
+                # 화면 범위 맞춤
                 try:
                     all_pts=[]
                     for (si,dj) in pairs_to_draw:
