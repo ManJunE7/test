@@ -70,7 +70,7 @@ PALETTE = ["#4285f4","#34a853","#ea4335","#fbbc04","#7e57c2","#26a69a","#ef6c00"
 MATRIX_MAX_COORDS = 25
 KOREA_CRS_METRIC   = "EPSG:5179"
 
-DATA_STEM = "new_new_drt_min_utf8"  # 파일명 앞부분 고정
+DATA_STEM = "new_new_drt_full_utf8"  # 파일명 앞부분 고정
 
 # ===================== 유틸 =====================
 def haversine(xy1, xy2):
