@@ -1,12 +1,15 @@
-# app_cheonan_drt_local_rg_jibun_safe.py
+# app.py
 # ---------------------------------------------------------
-# 천안 DRT - new_new_drt.*(EUC-KR 우선) + 'jibun' 기반 정류장명
-# 안전 로더: 인코딩/엔진 다단계 시도로 UnicodeDecodeError 회피
-# 로컬 역지오코딩(가까운 포인트 name), Mapbox Matrix+Directions(과금보호)
+# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드
+# - 데이터 소스 고정: new_new_drt_min_utf8.(shp/gpkg/geojson)
+# - 정류장 이름(name) = 지번(jibun)
+# - 과금보호: Matrix로 상위 N개만 Directions 호출 (fallback: haversine)
 # ---------------------------------------------------------
+
 import os
 import math
 from pathlib import Path
+from typing import List, Tuple
 
 import geopandas as gpd
 import pandas as pd
@@ -19,7 +22,8 @@ from folium.features import DivIcon
 from shapely.geometry import Point
 from streamlit_folium import st_folium
 
-# ===================== 기본 설정 / 스타일 =====================
+
+# ===================== 기본 설정/스타일 =====================
 APP_TITLE = "천안 DRT - 맞춤형 AI기반 스마트 교통 가이드"
 LOGO_URL  = "https://raw.githubusercontent.com/JeongWon4034/cheongju/main/cheongpung_logo.png"
 
@@ -40,6 +44,7 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMa
 .empty{color:#9ca3af;background:linear-gradient(135deg,#ffecd2 0%,#fcb69f 100%);border-radius:12px;padding:22px 14px;text-align:center}
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown(
     f"""
     <div class="header-container">
@@ -51,8 +56,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# ===================== 토큰 / 상수 =====================
-MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # << 직접 넣거나 환경변수/Secrets(MAPBOX_TOKEN) 사용
+# ===================== 토큰/상수 =====================
+MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # << 여기에 직접 입력하거나, 환경변수/Secrets(MAPBOX_TOKEN)에 설정
 if not MAPBOX_TOKEN:
     MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
@@ -62,191 +67,109 @@ if not MAPBOX_TOKEN:
         pass
 
 PALETTE = ["#4285f4","#34a853","#ea4335","#fbbc04","#7e57c2","#26a69a","#ef6c00","#c2185b"]
-MATRIX_MAX_COORDS = 25
-KOREA_CRS_METRIC = "EPSG:5179"
+MATRIX_MAX_COORDS = 25        # Matrix API 좌표 총합 제한
+KOREA_CRS_METRIC   = "EPSG:5179"  # 근거리 거리계산용
 
-# ===================== 안전 로더(Shapefile/CSV) =====================
-def read_vector_safe(path: Path) -> gpd.GeoDataFrame:
-    """
-    Shapefile/GeoPackage/GeoJSON 등 벡터 파일을 인코딩/엔진을 바꿔가며 안전하게 읽는다.
-    시도 순서: euc-kr -> cp949 -> utf-8 -> 기본 -> pyogrio(errors='replace') -> fiona(SHAPE_ENCODING=CP949)
-    """
-    encodings = ["euc-kr", "cp949", "utf-8", None]
-    last_err = None
 
-    for enc in encodings:
-        try:
-            if enc is None:
-                return gpd.read_file(path)
-            return gpd.read_file(path, encoding=enc)
-        except Exception as e:
-            last_err = e
+# ===================== 데이터 로더 (소스 고정) =====================
+DATA_STEM = "new_new_drt_min_utf8"  # 파일명 앞부분 고정
 
-    # pyogrio 저수준 + errors='replace'
-    try:
-        from pyogrio import read_dataframe as pio_read_df
-        g = pio_read_df(path, encoding="cp949", errors="replace")
-        if not isinstance(g, gpd.GeoDataFrame):
-            g = gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g, "crs", None))
-        return g
-    except Exception as e:
-        last_err = e
-
-    # fiona 엔진 폴백
-    try:
-        os.environ["SHAPE_ENCODING"] = "CP949"
-        return gpd.read_file(path, engine="fiona")
-    except Exception as e:
-        last_err = e
-        raise last_err
-
-def read_csv_safe(path: Path) -> pd.DataFrame:
-    for enc in ["euc-kr", "cp949", "utf-8-sig", "utf-8"]:
-        try:
-            return pd.read_csv(path, encoding=enc)
-        except Exception:
-            continue
-    # 최후: 바이너리 디코딩 실패 시 에러
-    return pd.read_csv(path, encoding="euc-kr", errors="replace")
-
-# ===================== 좌표계/라벨 유틸 =====================
-def to_wgs84_auto(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    if gdf.crs:
-        try:
-            return gdf.to_crs(epsg=4326)
-        except Exception:
-            pass
-    try:
-        return gdf.set_crs(epsg=5179, allow_override=True).to_crs(epsg=4326)
-    except Exception:
-        return gdf.set_crs(epsg=4326, allow_override=True)
-
-def _find_first(pattern: str) -> Path | None:
-    try:
-        return next(Path(".").rglob(pattern))
-    except StopIteration:
-        return None
-
-def _make_unique(series: pd.Series) -> pd.Series:
-    series = series.fillna("").astype(str).str.strip()
-    counts = {}
-    out = []
-    for v in series:
-        key = v if v else "정류장"
-        counts[key] = counts.get(key, 0) + 1
-        out.append(key if counts[key] == 1 else f"{key} ({counts[key]})")
-    return pd.Series(out, index=series.index)
-
-def apply_jibun_as_name(g: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    if "jibun" in g.columns:
-        g["name"] = _make_unique(g["jibun"])
-    else:
-        # 다른 텍스트 컬럼이 있으면 선택
-        pick = None
-        for c in ["name","정류장명","정류장","stop_name","station","st_name","poi_name","label","title","NAME","Name"]:
-            if c in g.columns and (g[c].dtype == "object" or str(g[c].dtype).startswith("string")):
-                pick = c; break
-        g["name"] = _make_unique(g[pick]) if pick else [f"정류장_{i+1}" for i in range(len(g))]
-    return g
-
-# ===================== 데이터 로드 =====================
-@st.cache_data
-def load_stops():
-    shp = _find_first("new_new_drt.shp")
-    if shp:
-        g0 = read_vector_safe(shp)
-        pts = g0[g0.geom_type.astype(str).str.contains("Point", case=False, na=False)]
-        if pts.empty:
-            g0 = g0.copy(); g0["geometry"] = g0.geometry.representative_point(); pts = g0
-        g = to_wgs84_auto(pts)
-        g = apply_jibun_as_name(g)
-        g["lon"], g["lat"] = g.geometry.x, g.geometry.y
-        st.caption(f"데이터셋: new_new_drt.shp · {len(g)}개 포인트 (이름=jibun)")
-        return g[["name","lon","lat","geometry"]]
-
-    csvp = _find_first("new_new_drt.csv")
-    if csvp:
-        df = read_csv_safe(csvp)
-        # lon/lat 추정
-        lon_keys = ["lon","lng","long","x","경도","LON","LNG","LONG","X"]
-        lat_keys = ["lat","y","위도","LAT","Y"]
-        lon_col = next((c for c in df.columns if str(c).lower() in [k.lower() for k in lon_keys]), None)
-        lat_col = next((c for c in df.columns if str(c).lower() in [k.lower() for k in lat_keys]), None)
-        if lon_col is None or lat_col is None:
-            raise RuntimeError("CSV에서 경도/위도 컬럼을 찾지 못했습니다. (예: lon/lat, x/y, 경도/위도)")
-        df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
-        df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
-        df = df.dropna(subset=[lon_col, lat_col])
-        g = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326")
-        g = apply_jibun_as_name(g)
-        g["lon"], g["lat"] = g.geometry.x, g.geometry.y
-        st.caption(f"데이터셋: new_new_drt.csv · {len(g)}개 포인트 (이름=jibun)")
-        return g[["name","lon","lat","geometry"]]
-
-    st.error("new_new_drt.shp/csv 를 찾지 못했습니다.")
+def _open_any() -> gpd.GeoDataFrame:
+    """new_new_drt_min_utf8.* 중 존재하는 걸 하나 연다 (UTF-8)"""
+    for ext in (".shp", ".gpkg", ".geojson"):
+        p = Path(f"./{DATA_STEM}{ext}")
+        if p.exists():
+            g = gpd.read_file(p)  # 내보낸 파일은 UTF-8이라 인코딩 옵션 불필요
+            # 좌표계 보정
+            try:
+                if g.crs and g.crs.to_epsg() != 4326:
+                    g = g.to_crs(epsg=4326)
+            except Exception:
+                pass
+            # 포인트 보장
+            if not g.geom_type.astype(str).str.contains("Point", case=False, na=False).any():
+                g = g.copy()
+                g["geometry"] = g.geometry.representative_point()
+            return g
+    st.error(f"'{DATA_STEM}.shp/.gpkg/.geojson' 중 하나를 같은 폴더에 두세요.")
     st.stop()
 
 @st.cache_data
-def load_label_source():
-    shp = _find_first("new_new_drt.shp")
-    if shp:
-        g0 = read_vector_safe(shp)
-        g0 = to_wgs84_auto(g0)
-        g0 = apply_jibun_as_name(g0)
-        return g0
-    csvp = _find_first("new_new_drt.csv")
-    if csvp:
-        df = read_csv_safe(csvp)
-        lon_keys = ["lon","lng","long","x","경도","LON","LNG","LONG","X"]
-        lat_keys = ["lat","y","위도","LAT","Y"]
-        lon_col = next((c for c in df.columns if str(c).lower() in [k.lower() for k in lon_keys]), None)
-        lat_col = next((c for c in df.columns if str(c).lower() in [k.lower() for k in lat_keys]), None)
-        df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
-        df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
-        df = df.dropna(subset=[lon_col, lat_col])
-        g = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326")
-        g = apply_jibun_as_name(g)
-        return g
-    return None
+def load_stops() -> gpd.GeoDataFrame:
+    g = _open_any()
+    if "jibun" not in g.columns:
+        st.error("소스에 'jibun' 필드가 없습니다. (정류장 지번 필드가 필요합니다)")
+        st.stop()
+    g = g.copy()
+    g["jibun"] = g["jibun"].astype(str).str.strip()
+    g["name"]  = g["jibun"]  # 이름=지번
+    g["lon"]   = g.geometry.x
+    g["lat"]   = g.geometry.y
+    st.caption(f"데이터셋: {DATA_STEM} (포인트 {len(g)}개 · UTF-8 · 이름=지번)")
+    return g[["jibun","name","lon","lat","geometry"]]
+
+@st.cache_data
+def load_label_source() -> gpd.GeoDataFrame:
+    """로컬 역지오코딩(가까운 라벨)도 같은 데이터로"""
+    g = _open_any()
+    if "jibun" not in g.columns:
+        st.error("소스에 'jibun' 필드가 없습니다.")
+        st.stop()
+    g = g.copy()
+    g["name"] = g["jibun"].astype(str).str.strip()
+    return g
 
 stops     = load_stops()
 label_gdf = load_label_source()
 
+# 경계(선택사항): 있으면 표시
 @st.cache_data
 def load_boundary():
-    for nm in ["cb_shp","boundary","admin_boundary","cheonan_boundary"]:
+    for nm in ["boundary","admin_boundary","cb_shp","cheonan_boundary"]:
         for ext in ["shp","geojson","gpkg","json"]:
-            p = _find_first(f"**/{nm}.{ext}")
+            p = next(Path(".").rglob(f"{nm}.{ext}"), None)
             if p:
-                g0 = read_vector_safe(p)
-                return to_wgs84_auto(g0)
+                try:
+                    g0 = gpd.read_file(p)
+                    if g0.crs and g0.crs.to_epsg() != 4326:
+                        g0 = g0.to_crs(epsg=4326)
+                    return g0
+                except Exception:
+                    pass
     return None
 
 boundary = load_boundary()
 
+# 중심점
 ctr_lat = float(stops["lat"].mean()); ctr_lon = float(stops["lon"].mean())
 if math.isnan(ctr_lat) or math.isnan(ctr_lon): ctr_lat, ctr_lon = 36.80, 127.15
 
-# ===================== 로컬 역지오코딩 =====================
+
+# ===================== 로컬 역지오코딩 (가까운 포인트 라벨) =====================
 @st.cache_data
 def local_reverse_label(lon: float, lat: float) -> str | None:
     if label_gdf is None or label_gdf.empty:
         return None
-    g_m = label_gdf.to_crs(KOREA_CRS_METRIC)
-    p_m = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(KOREA_CRS_METRIC).iloc[0]
     try:
+        g_m = label_gdf.to_crs(KOREA_CRS_METRIC)
+        p_m = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(KOREA_CRS_METRIC).iloc[0]
+        # sindex가 있으면 가장 가까운 후보 1개
         idx_candidates = list(g_m.sindex.nearest(p_m.bounds, 1))
         idx0 = idx_candidates[0] if idx_candidates else None
+        if idx0 is None:
+            dists = g_m.geometry.distance(p_m)
+            idx0 = int(dists.idxmin())
+        nm = str(label_gdf.loc[idx0, "name"]).strip()
+        return nm or None
     except Exception:
-        idx0 = None
-    if idx0 is None:
-        dists = g_m.geometry.distance(p_m)
-        if dists.empty: return None
+        # 간단한 fallback: 최단 거리 수동 계산
+        dists = label_gdf.geometry.distance(Point(lon, lat))
         idx0 = int(dists.idxmin())
-    nm = str(label_gdf.loc[idx0, "name"]).strip()
-    return nm or None
+        nm = str(label_gdf.loc[idx0, "name"]).strip()
+        return nm or None
 
-# ===================== Mapbox 라우팅 =====================
+
+# ===================== Mapbox 라우팅/매트릭스 =====================
 def mapbox_route(lon1, lat1, lon2, lat2, profile="driving", token="", timeout=12):
     if not token: raise RuntimeError("MAPBOX_TOKEN 필요")
     url = f"https://api.mapbox.com/directions/v5/mapbox/{profile}/{lon1},{lat1};{lon2},{lat2}"
@@ -258,34 +181,47 @@ def mapbox_route(lon1, lat1, lon2, lat2, profile="driving", token="", timeout=12
     rt = routes[0]
     return rt["geometry"]["coordinates"], float(rt.get("duration",0.0)), float(rt.get("distance",0.0))
 
-def mapbox_matrix(sources_xy, destinations_xy, profile="driving", token="", timeout=12):
+def mapbox_matrix(sources_xy: List[Tuple[float,float]],
+                  destinations_xy: List[Tuple[float,float]],
+                  profile="driving", token="", timeout=12):
     if not token: raise RuntimeError("MAPBOX_TOKEN 필요")
     coords = sources_xy + destinations_xy
     if len(coords) > MATRIX_MAX_COORDS:
-        raise RuntimeError(f"Matrix 좌표 총합 {len(coords)}개 — {MATRIX_MAX_COORDS}개 이하로 줄여주세요.")
+        raise RuntimeError(f"Matrix 좌표 총합 {len(coords)}개 — {MATRIX_MAX_COORDS}개 이하만 지원")
     coord_str = ";".join([f"{x},{y}" for x,y in coords])
     src_idx = ";".join(map(str, range(len(sources_xy))))
     dst_idx = ";".join(map(str, range(len(sources_xy), len(coords))))
     url = f"https://api.mapbox.com/directions-matrix/v1/mapbox/{profile}/{coord_str}"
-    params = {"access_token": token, "annotations": "duration,distance", "sources": src_idx, "destinations": dst_idx}
+    params = {"access_token": token, "annotations": "duration,distance",
+              "sources": src_idx, "destinations": dst_idx}
     r = requests.get(url, params=params, timeout=timeout)
     if r.status_code != 200: raise RuntimeError(f"Matrix 오류 {r.status_code}: {r.text[:160]}")
     j = r.json()
     return j.get("durations"), j.get("distances")
+
+def haversine(xy1, xy2):
+    R=6371000.0
+    lon1,lat1,lon2,lat2 = map(np.radians,[xy1[0],xy1[1],xy2[0],xy2[1]])
+    dlon=lon2-lon1; dlat=lat2-lat1
+    a=np.sin(dlat/2)**2+np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return 2*R*np.arcsin(np.sqrt(a))
+
 
 # ===================== UI =====================
 col1, col2, col3 = st.columns([1.7,1.1,3.2], gap="large")
 
 with col1:
     st.markdown('<div class="section-header">🚏 DRT 노선 추천 설정</div>', unsafe_allow_html=True)
-    mode = st.radio("운행 모드", ["차량(운행)","도보(승객 접근)"], horizontal=True)
+    mode    = st.radio("운행 모드", ["차량(운행)","도보(승객 접근)"], horizontal=True)
     profile = "driving" if mode.startswith("차량") else "walking"
 
-    starts = st.multiselect("출발(승차) 정류장", stops["name"].tolist(), key="starts")
-    ends   = st.multiselect("도착(하차) 정류장", stops["name"].tolist(), key="ends")
+    all_names = stops["name"].tolist()
+    starts = st.multiselect("출발(승차) 정류장", all_names, key="starts")
+    ends   = st.multiselect("도착(하차) 정류장", all_names, key="ends")
 
     pairing = st.selectbox("매칭 방식", ["인덱스 쌍(1:1)","모든 조합"], index=1)
-    top_k = st.slider("과금보호: 최대 경로 수(N)", 1, 50, 5)
+    top_k   = st.slider("과금보호: 최대 경로 수(N)", 1, 50, 5,
+                        help="모든 조합을 Matrix로 평가 후 상위 N개만 Directions 호출. (Matrix 좌표 총합 25 제한)")
 
     cA, cB, cC = st.columns(3)
     run_clicked   = cA.button("노선 추천")
@@ -335,7 +271,7 @@ with col3:
                 st.warning("유효한 좌표가 없습니다.")
             else:
                 total_min, total_km = 0.0, 0.0
-                pairs_to_draw = []
+                pairs_to_draw: List[Tuple[int,int]] = []
 
                 if pairing.startswith("인덱스"):
                     n = min(len(src_xy), len(dst_xy), top_k)
@@ -345,33 +281,30 @@ with col3:
                     if pair_count == 1:
                         pairs_to_draw = [(0,0)]
                     else:
-                        try:
-                            durations, distances = mapbox_matrix(src_xy, dst_xy, profile=profile, token=MAPBOX_TOKEN)
-                            scored=[]
-                            for i in range(len(src_xy)):
-                                for j in range(len(dst_xy)):
-                                    dur = None if not durations or not durations[i] else durations[i][j]
-                                    if dur is None: continue
-                                    dist = (distances[i][j] if distances and distances[i] else float("inf"))
-                                    scored.append((dur, dist, i, j))
-                            scored.sort(key=lambda x: (x[0], x[1]))
-                            pairs_to_draw = [(i,j) for _,_,i,j in scored[:top_k]]
-                        except Exception as e:
-                            st.warning(f"Matrix 오류로 근사 정렬 사용: {e}")
-                            def hav(xy1, xy2):
-                                R=6371000.0
-                                lon1,lat1,lon2,lat2 = map(np.radians,[xy1[0],xy1[1],xy2[0],xy2[1]])
-                                dlon=lon2-lon1; dlat=lat2-lat1
-                                a=np.sin(dlat/2)**2+np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
-                                return 2*R*np.arcsin(np.sqrt(a))
+                        # Matrix 좌표 제한 초과시 haversine 근사
+                        if len(src_xy) + len(dst_xy) <= MATRIX_MAX_COORDS:
+                            try:
+                                durations, distances = mapbox_matrix(src_xy, dst_xy, profile=profile, token=MAPBOX_TOKEN)
+                                scored=[]
+                                for i in range(len(src_xy)):
+                                    for j in range(len(dst_xy)):
+                                        dur = None if not durations or not durations[i] else durations[i][j]
+                                        if dur is None: continue
+                                        dist = (distances[i][j] if distances and distances[i] else float("inf"))
+                                        scored.append((dur, dist, i, j))
+                                scored.sort(key=lambda x: (x[0], x[1]))
+                                pairs_to_draw = [(i,j) for _,_,i,j in scored[:top_k]]
+                            except Exception as e:
+                                st.warning(f"Matrix 오류로 근사 정렬 사용: {e}")
+                        if not pairs_to_draw:
                             scored=[]
                             for i,s in enumerate(src_xy):
                                 for j,d in enumerate(dst_xy):
-                                    scored.append((hav(s,d), i, j))
+                                    scored.append((haversine(s,d), i, j))
                             scored.sort(key=lambda x: x[0])
                             pairs_to_draw = [(i,j) for _,i,j in scored[:top_k]]
 
-                # Directions 호출 + 로컬 역지오코딩 라벨(name)
+                # Directions 호출 + 라벨 표시
                 for idx, (si, dj) in enumerate(pairs_to_draw):
                     sxy, exy = src_xy[si], dst_xy[dj]
                     s_label = local_reverse_label(sxy[0], sxy[1]) or starts[si]
@@ -382,7 +315,10 @@ with col3:
                         ll = [(c[1], c[0]) for c in coords]
                         folium.PolyLine(ll, color=PALETTE[idx % len(PALETTE)], weight=5, opacity=0.9).add_to(m)
                         mid = ll[len(ll)//2]
-                        folium.map.Marker(mid, icon=DivIcon(html=f"<div style='background:{PALETTE[idx%len(PALETTE)]};color:#fff;border-radius:50%;width:26px;height:26px;line-height:26px;text-align:center;font-weight:700;'>{idx+1}</div>")).add_to(m)
+                        folium.map.Marker(
+                            mid,
+                            icon=DivIcon(html=f"<div style='background:{PALETTE[idx%len(PALETTE)]};color:#fff;border-radius:50%;width:26px;height:26px;line-height:26px;text-align:center;font-weight:700;'>{idx+1}</div>")
+                        ).add_to(m)
                         folium.Marker([sxy[1], sxy[0]], icon=folium.Icon(color="red"),  tooltip=f"승차: {s_label}").add_to(m)
                         folium.Marker([exy[1], exy[0]], icon=folium.Icon(color="blue"), tooltip=f"하차: {e_label}").add_to(m)
                         total_min += dur/60; total_km += dist/1000
@@ -398,6 +334,7 @@ with col3:
                 st.session_state["duration"] = total_min
                 st.session_state["distance"] = total_km
 
+                # 보기 좋게 화면 맞추기
                 try:
                     all_pts=[]
                     for (si,dj) in pairs_to_draw:
