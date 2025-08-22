@@ -21,7 +21,10 @@ def load_data():
 
         bus_data = {}
         for i in range(1, 5):
-            bus_data[f"drt_{i}"] = gpd.read_file(f"./drt_{i}.shp").to_crs(epsg=4326)
+            bus_data[f"drt_1"] = gpd.read_file(f"./drt_1.shp").to_crs(epsg=4326),
+            bus_data[f"drt_2"] = gpd.read_file(f"./drt_2.shp").to_crs(epsg=4326),
+            bus_data[f"drt_3"] = gpd.read_file(f"./drt_3.shp").to_crs(epsg=4326),
+            bus_data[f"drt_4"] = gpd.read_file(f"./drt_4.shp").to_crs(epsg=4326)
 
         return stops, bus_data
     except Exception as e:
