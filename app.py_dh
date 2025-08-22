@@ -1,0 +1,169 @@
+# app.py — DRT: 승·하차 선택 → 최적 경로(시간/거리) + 지도만 표출
+import os
+import requests
+import streamlit as st
+import geopandas as gpd
+import pandas as pd
+import folium
+from shapely.geometry import LineString, MultiLineString
+from streamlit_folium import st_folium
+
+# ──────────────────────────────
+# 설정 (토큰은 Streamlit Secrets에 두는 걸 권장)
+# ──────────────────────────────
+MAPBOX_TOKEN = st.secrets.get("MAPBOX_TOKEN", "").strip() or "YOUR_MAPBOX_TOKEN"
+
+st.set_page_config(page_title="천안 DRT – 경로 최적화", layout="wide")
+
+# ──────────────────────────────
+# 유틸
+# ──────────────────────────────
+def to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    try:
+        if gdf.crs is None:
+            return gdf.set_crs(epsg=4326)
+        return gdf.to_crs(epsg=4326)
+    except Exception:
+        return gdf
+
+def to_linestring(geom):
+    """MultiLineString이면 가장 긴 선만 추출"""
+    if isinstance(geom, MultiLineString):
+        geom = max(list(geom.geoms), key=lambda L: L.length)
+    return geom if isinstance(geom, LineString) else None
+
+def build_stops_from_route(route_gdf: gpd.GeoDataFrame, route_name: str) -> pd.DataFrame:
+    """노선 라인의 모든 꼭짓점을 '정류장'처럼 사용"""
+    geom = to_linestring(route_gdf.geometry.iloc[0])
+    if geom is None:
+        return pd.DataFrame(columns=["name", "lon", "lat"])
+    coords = list(geom.coords)                     # [(lon,lat),...]
+    rows = [{"name": f"{route_name} {i+1}번 정류장", "lon": x, "lat": y} for i, (x, y) in enumerate(coords)]
+    return pd.DataFrame(rows)
+
+def mapbox_route(p, q, profile="driving"):
+    """p/q=(lon,lat) → Mapbox Directions 요청. 실패 시 None 반환"""
+    if not MAPBOX_TOKEN or MAPBOX_TOKEN.startswith("YOUR_"):
+        return None
+    url = f"https://api.mapbox.com/directions/v5/mapbox/{profile}/{p[0]},{p[1]};{q[0]},{q[1]}"
+    params = {"geometries": "geojson", "overview": "full", "access_token": MAPBOX_TOKEN}
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("routes"):
+            return None
+        route = data["routes"][0]
+        return {
+            "coords": route["geometry"]["coordinates"],   # [[lon,lat],...]
+            "distance_m": route.get("distance", 0.0),
+            "duration_s": route.get("duration", 0.0),
+        }
+    except Exception:
+        return None
+
+def fallback_line(p, q, speed_kmh=30.0):
+    """Mapbox 실패 시 직선 경로 + 단순 시간 추정"""
+    from math import radians, sin, cos, asin, sqrt
+    R = 6371000.0
+    lon1, lat1, lon2, lat2 = map(radians, [p[0], p[1], q[0], q[1]])
+    dlon, dlat = lon2 - lon1, lat2 - lat1
+    h = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    dist_m = 2*R*asin(sqrt(h))
+    dura_s = (dist_m/1000.0)/speed_kmh*3600.0
+    return {"coords": [list(p), list(q)], "distance_m": dist_m, "duration_s": dura_s}
+
+# ──────────────────────────────
+# 데이터 로드
+# ──────────────────────────────
+@st.cache_data
+def load_routes():
+    routes = {}
+    for i in range(1, 5):
+        shp = f"./drt_{i}.shp"
+        if os.path.exists(shp):
+            gdf = to_wgs84(gpd.read_file(shp))
+            routes[f"DRT-{i}호선"] = gdf
+    return routes
+
+ROUTES = load_routes()
+if not ROUTES:
+    st.error("drt_1~4.shp 중 최소 1개는 레포 루트에 있어야 합니다.")
+    st.stop()
+
+# ──────────────────────────────
+# UI — 왼쪽: 입력 / 오른쪽: 결과
+# ──────────────────────────────
+left, right = st.columns([1.1, 2.4], gap="large")
+
+with left:
+    st.subheader("🚌 승·하차 설정")
+    route_name = st.selectbox("운행 노선", list(ROUTES.keys()))
+    stops_df = build_stops_from_route(ROUTES[route_name], route_name)
+    if stops_df.empty:
+        st.error("노선 라인 형식이 올바르지 않습니다.")
+        st.stop()
+
+    start_name = st.selectbox("출발 정류장", stops_df["name"])
+    end_name   = st.selectbox("도착 정류장", [n for n in stops_df["name"] if n != start_name])
+    go = st.button("경로 최적화 및 계산")
+
+# 결과 상태
+if "result" not in st.session_state:
+    st.session_state.result = None
+
+if go:
+    # 선택한 좌표
+    srow = stops_df[stops_df["name"] == start_name].iloc[0]
+    erow = stops_df[stops_df["name"] == end_name].iloc[0]
+    p = (float(srow["lon"]), float(srow["lat"]))
+    q = (float(erow["lon"]), float(erow["lat"]))
+
+    res = mapbox_route(p, q, profile="driving")
+    if res is None:
+        res = fallback_line(p, q, speed_kmh=30.0)
+
+    st.session_state.result = {
+        "order": [start_name, end_name],
+        "poly": res["coords"],          # [[lon,lat],...]
+        "km":   res["distance_m"]/1000.0,
+        "min":  res["duration_s"]/60.0,
+        "start": (p[1], p[0]),          # (lat,lon)
+        "end":   (q[1], q[0]),
+        "route_name": route_name,
+    }
+
+with right:
+    st.subheader("📊 결과")
+    res = st.session_state.result
+    if res:
+        c1, c2, c3 = st.columns([1,1,2])
+        with c1: st.metric("📏 거리", f"{res['km']:.2f} km")
+        with c2: st.metric("⏱ 소요시간", f"{res['min']:.1f} 분")
+        with c3: st.write(f"**운행 순서:** {res['order'][0]} → {res['order'][1]}")
+
+        # 지도
+        center = ((res["start"][0]+res["end"][0])/2, (res["start"][1]+res["end"][1])/2)
+        m = folium.Map(location=center, zoom_start=13, tiles="CartoDB Positron")
+
+        # 선택 노선 라인(원본 shp 라인, 참고용)
+        geom = to_linestring(ROUTES[res["route_name"]].geometry.iloc[0])
+        if geom is not None:
+            folium.PolyLine([(lat, lon) for lon, lat in list(geom.coords)],
+                            color="#9aa0a6", weight=4, opacity=0.4,
+                            tooltip=f"{res['route_name']} (원본)").add_to(m)
+
+        # 최적 경로(실제 운행 경로)
+        folium.PolyLine([(lat, lon) for lon, lat in res["poly"]],
+                        color="#2b7de9", weight=6, opacity=0.9,
+                        tooltip="최적 경로").add_to(m)
+
+        # 출발/도착 마커
+        folium.Marker(res["start"], tooltip=res["order"][0],
+                      icon=folium.Icon(color="green", icon="play")).add_to(m)
+        folium.Marker(res["end"], tooltip=res["order"][1],
+                      icon=folium.Icon(color="red", icon="stop")).add_to(m)
+
+        st_folium(m, height=540, use_container_width=True)
+    else:
+        st.info("왼쪽에서 승·하차를 선택하고 **경로 최적화 및 계산**을 눌러주세요.")
