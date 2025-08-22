@@ -61,7 +61,7 @@ st.markdown(
 # ===================== 토큰/상수 =====================
 MAPBOX_TOKEN = ""  # << 여기에 네 Mapbox 토큰을 넣어줘.
 if not MAPBOX_TOKEN:
-    MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
+    MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ")
 if not MAPBOX_TOKEN:
     try:
         MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
