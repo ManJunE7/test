@@ -1,13 +1,13 @@
 # app.py
 # ---------------------------------------------------------
 # 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드
-# - 데이터 소스 고정: new_new_drt_min_utf8.(shp/gpkg/geojson)
+# - 데이터 소스: new_new_drt_min_utf8.(shp/gpkg/geojson)
 # - 정류장 이름(name) = 지번(jibun)
-# - 과금보호: Matrix로 상위 N개만 Directions 호출 (fallback: haversine)
+# - UTF-8 강제 로더(휴리스틱 포함)로 한글 깨짐 방지
+# - Mapbox Matrix + Directions (과금보호)
 # ---------------------------------------------------------
 
-import os
-import math
+import os, math, re
 from pathlib import Path
 from typing import List, Tuple
 
@@ -21,7 +21,6 @@ from folium.plugins import MarkerCluster
 from folium.features import DivIcon
 from shapely.geometry import Point
 from streamlit_folium import st_folium
-
 
 # ===================== 기본 설정/스타일 =====================
 APP_TITLE = "천안 DRT - 맞춤형 AI기반 스마트 교통 가이드"
@@ -57,7 +56,7 @@ st.markdown(
 )
 
 # ===================== 토큰/상수 =====================
-MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # << 여기에 직접 입력하거나, 환경변수/Secrets(MAPBOX_TOKEN)에 설정
+MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # << 직접 입력하거나 환경변수/Secrets로 설정
 if not MAPBOX_TOKEN:
     MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
@@ -67,19 +66,51 @@ if not MAPBOX_TOKEN:
         pass
 
 PALETTE = ["#4285f4","#34a853","#ea4335","#fbbc04","#7e57c2","#26a69a","#ef6c00","#c2185b"]
-MATRIX_MAX_COORDS = 25        # Matrix API 좌표 총합 제한
-KOREA_CRS_METRIC   = "EPSG:5179"  # 근거리 거리계산용
+MATRIX_MAX_COORDS = 25
+KOREA_CRS_METRIC   = "EPSG:5179"
 
+# ===================== 데이터 로더 (UTF-8 강제 + 휴리스틱) =====================
+DATA_STEM = "new_new_drt_min_utf8"
 
-# ===================== 데이터 로더 (소스 고정) =====================
-DATA_STEM = "new_new_drt_min_utf8"  # 파일명 앞부분 고정
+def _looks_garbled_korean(texts: list[str]) -> bool:
+    """한글이 있어야 할 샘플이 모지바케로 보이는지 간단히 판별"""
+    if not texts: return False
+    hangul = sum(len(re.findall(r"[\uac00-\ud7a3]", s)) for s in texts)
+    # UTF-8이 라틴1/기타로 잘못 디코딩됐을 때 자주 보이는 글자들
+    weird  = sum(len(re.findall(r"[ìÍÎÏÃãÂåäÄÅæÆ¸¼½¾¤¦©«»¿�]", s)) for s in texts)
+    # 한글 거의 없고 이상한 글자 많으면 깨짐으로 간주
+    return (hangul < 3 and weird >= 2)
+
+def _read_utf8_shp(path: Path) -> gpd.GeoDataFrame:
+    """shp를 UTF-8로 강제 읽기 (pyogrio → geopandas → fiona 순서)"""
+    # 1) pyogrio 우선
+    try:
+        from pyogrio import read_dataframe as pio
+        g = pio(path, encoding="utf-8")
+        return gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g, "crs", None))
+    except Exception:
+        pass
+    # 2) geopandas 기본
+    try:
+        return gpd.read_file(path, encoding="utf-8")
+    except Exception:
+        pass
+    # 3) fiona 엔진
+    try:
+        os.environ["SHAPE_ENCODING"] = "UTF-8"
+        return gpd.read_file(path, engine="fiona")
+    except Exception as e:
+        raise e
 
 def _open_any() -> gpd.GeoDataFrame:
-    """new_new_drt_min_utf8.* 중 존재하는 걸 하나 연다 (UTF-8)"""
+    """new_new_drt_min_utf8.* 중 존재하는 걸 하나 연다. shp는 UTF-8 강제."""
     for ext in (".shp", ".gpkg", ".geojson"):
         p = Path(f"./{DATA_STEM}{ext}")
         if p.exists():
-            g = gpd.read_file(p)  # 내보낸 파일은 UTF-8이라 인코딩 옵션 불필요
+            if ext == ".shp":
+                g = _read_utf8_shp(p)
+            else:
+                g = gpd.read_file(p)  # GPKG/GeoJSON은 UTF-8 고정
             # 좌표계 보정
             try:
                 if g.crs and g.crs.to_epsg() != 4326:
@@ -90,7 +121,22 @@ def _open_any() -> gpd.GeoDataFrame:
             if not g.geom_type.astype(str).str.contains("Point", case=False, na=False).any():
                 g = g.copy()
                 g["geometry"] = g.geometry.representative_point()
+
+            # --- 인코딩 휴리스틱 검사: jibun 샘플 확인 ---
+            sample = []
+            cols = [c for c in ["jibun","name"] if c in g.columns]
+            for c in cols:
+                sample += g[c].dropna().astype(str).head(80).tolist()
+            if _looks_garbled_korean(sample):
+                # 혹시 환경이 cp949로 강제 디코딩했을 가능성 → 다시 한번 pyogrio utf-8 시도
+                try:
+                    from pyogrio import read_dataframe as pio
+                    g2 = pio(p, encoding="utf-8")
+                    g = gpd.GeoDataFrame(g2, geometry="geometry", crs=getattr(g2, "crs", None))
+                except Exception:
+                    pass
             return g
+
     st.error(f"'{DATA_STEM}.shp/.gpkg/.geojson' 중 하나를 같은 폴더에 두세요.")
     st.stop()
 
@@ -110,7 +156,6 @@ def load_stops() -> gpd.GeoDataFrame:
 
 @st.cache_data
 def load_label_source() -> gpd.GeoDataFrame:
-    """로컬 역지오코딩(가까운 라벨)도 같은 데이터로"""
     g = _open_any()
     if "jibun" not in g.columns:
         st.error("소스에 'jibun' 필드가 없습니다.")
@@ -122,7 +167,7 @@ def load_label_source() -> gpd.GeoDataFrame:
 stops     = load_stops()
 label_gdf = load_label_source()
 
-# 경계(선택사항): 있으면 표시
+# 경계(선택)
 @st.cache_data
 def load_boundary():
     for nm in ["boundary","admin_boundary","cb_shp","cheonan_boundary"]:
@@ -144,8 +189,7 @@ boundary = load_boundary()
 ctr_lat = float(stops["lat"].mean()); ctr_lon = float(stops["lon"].mean())
 if math.isnan(ctr_lat) or math.isnan(ctr_lon): ctr_lat, ctr_lon = 36.80, 127.15
 
-
-# ===================== 로컬 역지오코딩 (가까운 포인트 라벨) =====================
+# ===================== 로컬 역지오코딩 =====================
 @st.cache_data
 def local_reverse_label(lon: float, lat: float) -> str | None:
     if label_gdf is None or label_gdf.empty:
@@ -153,7 +197,6 @@ def local_reverse_label(lon: float, lat: float) -> str | None:
     try:
         g_m = label_gdf.to_crs(KOREA_CRS_METRIC)
         p_m = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(KOREA_CRS_METRIC).iloc[0]
-        # sindex가 있으면 가장 가까운 후보 1개
         idx_candidates = list(g_m.sindex.nearest(p_m.bounds, 1))
         idx0 = idx_candidates[0] if idx_candidates else None
         if idx0 is None:
@@ -162,12 +205,10 @@ def local_reverse_label(lon: float, lat: float) -> str | None:
         nm = str(label_gdf.loc[idx0, "name"]).strip()
         return nm or None
     except Exception:
-        # 간단한 fallback: 최단 거리 수동 계산
         dists = label_gdf.geometry.distance(Point(lon, lat))
         idx0 = int(dists.idxmin())
         nm = str(label_gdf.loc[idx0, "name"]).strip()
         return nm or None
-
 
 # ===================== Mapbox 라우팅/매트릭스 =====================
 def mapbox_route(lon1, lat1, lon2, lat2, profile="driving", token="", timeout=12):
@@ -205,7 +246,6 @@ def haversine(xy1, xy2):
     dlon=lon2-lon1; dlat=lat2-lat1
     a=np.sin(dlat/2)**2+np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
     return 2*R*np.arcsin(np.sqrt(a))
-
 
 # ===================== UI =====================
 col1, col2, col3 = st.columns([1.7,1.1,3.2], gap="large")
@@ -281,7 +321,6 @@ with col3:
                     if pair_count == 1:
                         pairs_to_draw = [(0,0)]
                     else:
-                        # Matrix 좌표 제한 초과시 haversine 근사
                         if len(src_xy) + len(dst_xy) <= MATRIX_MAX_COORDS:
                             try:
                                 durations, distances = mapbox_matrix(src_xy, dst_xy, profile=profile, token=MAPBOX_TOKEN)
@@ -334,7 +373,6 @@ with col3:
                 st.session_state["duration"] = total_min
                 st.session_state["distance"] = total_km
 
-                # 보기 좋게 화면 맞추기
                 try:
                     all_pts=[]
                     for (si,dj) in pairs_to_draw:
