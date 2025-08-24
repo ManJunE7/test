@@ -23,61 +23,66 @@ from streamlit_folium import st_folium
 import sys, os, inspect
 import streamlit as st
 
-def hard_reset(reason: str = "manual"):
-    # 1) 세션 스테이트 제거
-    for k in list(st.session_state.keys()):
-        try:
-            del st.session_state[k]
-        except Exception:
-            pass
+# ==== 강제 우회: GeoPandas read_file에서 engine='fiona' 무시 + pyogrio로 처리 ====
+import os, sys, inspect
+import streamlit as st
 
-    # 2) 모든 캐시/리소스 비우기
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-    try:
-        st.cache_resource.clear()
-    except Exception:
-        pass
-
-    # 3) 환경변수로 리셋 사유 남겨(디버깅 편의)
-    os.environ["APP_LAST_RESET_REASON"] = reason
-
-    # 4) 강제 재실행
-    st.toast("앱을 완전 초기화하고 재실행합니다…", icon="🔄")
-    st.rerun()
-
-def env_self_check():
-    import geopandas as gpd
-    st.write("🧪 Python:", sys.version.split()[0])
-    st.write("🧪 GeoPandas:", gpd.__version__)
-    try:
-        import pyogrio
-        st.write("🧪 pyogrio:", pyogrio.__version__)
-    except Exception as e:
-        st.error(f"pyogrio 미탑재 또는 인식 실패: {e}")
-    st.write("🧪 Working dir:", os.getcwd())
-    st.write("🧪 Running file:", os.path.abspath(__file__))
-
-    # (선택) 현재 소스에 fiona 엔진 강제 호출 흔적이 있는지 검사
-    try:
-        src = inspect.getsource(sys.modules[__name__])
-        if 'engine="fiona"' in src or "engine='fiona'" in src:
-            st.error("🚫 코드 안에 engine='fiona' 호출이 아직 남아 있습니다. 전부 제거하세요.")
-        else:
-            st.success("✅ 코드 내 engine='fiona' 호출 없음(OK).")
-    except Exception:
-        pass
-
-# 좌측 사이드바에 하드 리셋 UI
+# (선택) 완전 초기화 버튼
 with st.sidebar:
-    st.markdown("### 🧹 앱 하드 리셋")
-    if st.button("🔄 캐시·세션 완전 초기화 후 재실행"):
-        hard_reset("sidebar_button")
+    if st.button("🔄 캐시/세션 완전 초기화 후 재실행"):
+        for k in list(st.session_state.keys()):
+            try: del st.session_state[k]
+            except: pass
+        try: st.cache_data.clear()
+        except: pass
+        try: st.cache_resource.clear()
+        except: pass
+        st.rerun()
 
-    with st.expander("환경 자가진단 보기", expanded=False):
-        env_self_check()
+try:
+    import geopandas as gpd
+    from geopandas.io.file import _read_file as _gp_read_file
+    try:
+        # pyogrio가 반드시 필요합니다.
+        from pyogrio import read_dataframe as pio
+    except Exception as e:
+        st.error("pyogrio가 설치되어 있지 않습니다. requirements에 'pyogrio' 추가 후 재배포하세요.")
+        raise
+
+    # 원본 백업
+    if not hasattr(gpd, "_read_file_original__patched"):
+        gpd._read_file_original__patched = _gp_read_file
+
+    def _read_file_monkey(path_or_bytes, *args, **kwargs):
+        # 1) engine 파라미터가 들어와도 그냥 버림(= fiona 강제 우회)
+        kwargs.pop("engine", None)
+        # 2) 기본 경로(geopandas 내부 엔진 선택) 시도
+        try:
+            return gpd._read_file_original__patched(path_or_bytes, *args, **kwargs)
+        except ImportError:
+            # 환경상 기본 엔진 불가 → pyogrio로 직접 읽어서 GeoDataFrame 구성
+            enc = kwargs.get("encoding", None)
+            g = pio(path_or_bytes, encoding=enc)
+            return gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g, "crs", None))
+        except Exception:
+            # 어떤 이유로 실패하면 pyogrio로 재시도
+            enc = kwargs.get("encoding", None)
+            g = pio(path_or_bytes, encoding=enc)
+            return gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g, "crs", None))
+
+    # geopandas의 공개 API를 패치
+    gpd.read_file = _read_file_monkey
+
+    # 추가 안전장치: 여러분 코드 어딘가에서 내부 함수를 직접 호출해도 잡히도록
+    import geopandas.io.file as gpd_file_mod
+    gpd_file_mod._read_file = _read_file_monkey
+
+    # 참고 출력(한 번만)
+    st.caption("✅ Fiona 강제 우회/pyogrio 사용 패치 적용됨")
+
+except Exception as e:
+    st.error(f"GeoPandas/pyogrio 패치 중 오류: {e}")
+    raise
 
 
 # ===================== 기본 UI =====================
