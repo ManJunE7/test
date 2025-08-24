@@ -19,6 +19,66 @@ import folium
 from folium.plugins import MarkerCluster
 from folium.features import DivIcon
 from streamlit_folium import st_folium
+# ==== 하드 리셋 & 환경 체크 유틸 (import들 바로 아래에 넣으세요) ====
+import sys, os, inspect
+import streamlit as st
+
+def hard_reset(reason: str = "manual"):
+    # 1) 세션 스테이트 제거
+    for k in list(st.session_state.keys()):
+        try:
+            del st.session_state[k]
+        except Exception:
+            pass
+
+    # 2) 모든 캐시/리소스 비우기
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+    # 3) 환경변수로 리셋 사유 남겨(디버깅 편의)
+    os.environ["APP_LAST_RESET_REASON"] = reason
+
+    # 4) 강제 재실행
+    st.toast("앱을 완전 초기화하고 재실행합니다…", icon="🔄")
+    st.rerun()
+
+def env_self_check():
+    import geopandas as gpd
+    st.write("🧪 Python:", sys.version.split()[0])
+    st.write("🧪 GeoPandas:", gpd.__version__)
+    try:
+        import pyogrio
+        st.write("🧪 pyogrio:", pyogrio.__version__)
+    except Exception as e:
+        st.error(f"pyogrio 미탑재 또는 인식 실패: {e}")
+    st.write("🧪 Working dir:", os.getcwd())
+    st.write("🧪 Running file:", os.path.abspath(__file__))
+
+    # (선택) 현재 소스에 fiona 엔진 강제 호출 흔적이 있는지 검사
+    try:
+        src = inspect.getsource(sys.modules[__name__])
+        if 'engine="fiona"' in src or "engine='fiona'" in src:
+            st.error("🚫 코드 안에 engine='fiona' 호출이 아직 남아 있습니다. 전부 제거하세요.")
+        else:
+            st.success("✅ 코드 내 engine='fiona' 호출 없음(OK).")
+    except Exception:
+        pass
+
+# 좌측 사이드바에 하드 리셋 UI
+with st.sidebar:
+    st.markdown("### 🧹 앱 하드 리셋")
+    if st.button("🔄 캐시·세션 완전 초기화 후 재실행"):
+        hard_reset("sidebar_button")
+
+    with st.expander("환경 자가진단 보기", expanded=False):
+        env_self_check()
+
 
 # ===================== 기본 UI =====================
 APP_TITLE = "천안 DRT - 맞춤형 AI기반 스마트 교통 가이드"
