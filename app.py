@@ -1,11 +1,6 @@
 # app.py
 # ---------------------------------------------------------
-# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드 (Fiona 미사용 버전)
-# - 기존 DRT:   천안콜 버스 정류장(v250730)_4326.(gpkg/geojson/shp)
-# - 신규(후보):  new_new_drt_full_utf8.(gpkg/geojson/shp)
-# - 파일은 같은 폴더에 두세요. 우선순위: gpkg > geojson > shp
-# - Shapefile은 pyogrio로만 읽습니다. (Fiona 불필요)
-# - 라우팅: Mapbox Directions, 커버리지: 반경 버퍼→합집합→면적/차집합
+# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드 (Fiona 미사용 / pyogrio 전용)
 # ---------------------------------------------------------
 
 import os, math
@@ -25,7 +20,7 @@ from folium.plugins import MarkerCluster
 from folium.features import DivIcon
 from streamlit_folium import st_folium
 
-# ===================== 기본 설정/스타일 =====================
+# ===================== 기본 UI =====================
 APP_TITLE = "천안 DRT - 맞춤형 AI기반 스마트 교통 가이드"
 LOGO_URL  = "https://raw.githubusercontent.com/JeongWon4034/cheongju/main/cheongpung_logo.png"
 
@@ -46,21 +41,18 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMa
 """, unsafe_allow_html=True)
 st.markdown(f'<div class="header"><img src="{LOGO_URL}" width="56"/><div class="title">{APP_TITLE}</div></div>', unsafe_allow_html=True)
 
-# ===================== 경로/상수 =====================
+# ===================== 상수 =====================
 EXISTING_STEM  = "천안콜 버스 정류장(v250730)_4326"  # 기존 DRT 파일 스템
 CANDIDATE_STEM = "new_new_drt_full_utf8"           # 신규/후보 파일 스템
 PALETTE = ["#e74c3c","#8e44ad","#3498db","#e67e22","#16a085","#2ecc71","#1abc9c","#d35400"]
 
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
-    # 필요 시 직접 입력
     MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"
 
-# ===================== 파일 로딩(절대 Fiona 안 씀) =====================
+# ===================== 파일 로드 (pyogrio 전용) =====================
 def _read_shp_pyogrio(path: Path) -> gpd.GeoDataFrame:
-    """
-    Shapefile을 pyogrio로만 읽는다. (utf-8 → cp949 → 기본순)
-    """
+    """Shapefile을 pyogrio로만 읽는다. (utf-8 → cp949 → 기본)"""
     try:
         from pyogrio import read_dataframe as pio
     except Exception:
@@ -74,23 +66,21 @@ def _read_shp_pyogrio(path: Path) -> gpd.GeoDataFrame:
             return gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g, "crs", None))
         except Exception:
             continue
-    st.error(f"Shapefile 읽기에 실패했습니다: {path.name} (UTF-8/CP949 모두 실패)")
+    st.error(f"Shapefile 읽기 실패: {path.name} (UTF-8/CP949 모두 실패)")
     raise RuntimeError("Shapefile read failed")
 
 def _open_any(stem: str) -> gpd.GeoDataFrame:
-    """
-    stem.(gpkg|geojson|shp) 중 존재하는 것을 읽어 WGS84(Point)로 반환.
-    """
+    """stem.(gpkg|geojson|shp) 중 하나를 읽어 WGS84(Point)로 반환."""
     gpkg  = Path(f"./{stem}.gpkg")
     geojs = Path(f"./{stem}.geojson")
     shp   = Path(f"./{stem}.shp")
 
     if gpkg.exists():
-        g = gpd.read_file(gpkg)               # Fiona 엔진 지정 안 함
+        g = gpd.read_file(gpkg)       # engine 지정 안 함
     elif geojs.exists():
-        g = gpd.read_file(geojs)              # Fiona 엔진 지정 안 함
+        g = gpd.read_file(geojs)      # engine 지정 안 함
     elif shp.exists():
-        g = _read_shp_pyogrio(shp)            # pyogrio로만 읽기
+        g = _read_shp_pyogrio(shp)    # pyogrio만 사용
     else:
         st.error(f"'{stem}.gpkg/.geojson/.shp' 중 하나가 필요합니다.")
         st.stop()
@@ -104,36 +94,33 @@ def _open_any(stem: str) -> gpd.GeoDataFrame:
     # 포인트가 아니면 대표점으로 변환
     if not g.geom_type.astype(str).str.contains("Point", case=False, na=False).any():
         g = g.copy(); g["geometry"] = g.geometry.representative_point()
-
     return g
 
 @st.cache_data
-def load_existing_and_candidates():
+def load_existing_candidates():
+    """당신 앱이 호출하는 함수명 그대로 유지 (기존+신규 로드)."""
     existing = _open_any(EXISTING_STEM)
     # 이름 컬럼 유추
     nm_col = None
-    for c in ["name","정류장명","정류소명","jibun","NAME"]:
+    for c in ["name","정류장명","정류소명","정류장명_한글","jibun","NAME"]:
         if c in existing.columns:
             nm_col = c; break
     existing["name"] = existing[nm_col].astype(str) if nm_col else existing.index.astype(str)
     existing["lon"] = existing.geometry.x; existing["lat"] = existing.geometry.y
-    existing = existing[["name","lon","lat","geometry"]].copy()
+    existing = existing[["name","lon","lat","geometry"]]
 
     cand = _open_any(CANDIDATE_STEM)
-    if "name" in cand.columns:
-        cand["name"] = cand["name"].astype(str)
-    elif "jibun" in cand.columns:
-        cand["name"] = cand["jibun"].astype(str)
-    else:
-        cand["name"] = cand.index.astype(str)
+    if "name" in cand.columns: cand["name"] = cand["name"].astype(str)
+    elif "jibun" in cand.columns: cand["name"] = cand["jibun"].astype(str)
+    else: cand["name"] = cand.index.astype(str)
     cand["lon"] = cand.geometry.x; cand["lat"] = cand.geometry.y
-    cand = cand[["name","lon","lat","geometry"]].copy()
+    cand = cand[["name","lon","lat","geometry"]]
 
     ctr_lat = float(pd.concat([existing["lat"], cand["lat"]]).mean())
     ctr_lon = float(pd.concat([existing["lon"], cand["lon"]]).mean())
     return existing, cand, ctr_lat, ctr_lon
 
-# ===================== 라우팅 유틸 =====================
+# ===================== 라우팅/순회 유틸 =====================
 def haversine(xy1, xy2):
     R=6371000.0
     lon1,lat1,lon2,lat2 = map(np.radians,[xy1[0],xy1[1],xy2[0],xy2[1]])
@@ -158,10 +145,8 @@ def greedy_pairing(src_xy: List[Tuple[float,float]], dst_xy: List[Tuple[float,fl
     used = set(); mapping = [-1]*m
     for i in range(m):
         dists = [(haversine(src_xy[i], dst_xy[j]), j) for j in range(n) if j not in used]
-        j = min(dists, key=lambda x:x[0])[1] if dists else -1
-        mapping[i] = j; 
-        if j>=0: used.add(j)
-    # 남은 하차 배분
+        if dists:
+            j = min(dists, key=lambda x:x[0])[1]; mapping[i]=j; used.add(j)
     unused = [j for j in range(n) if j not in used]; ui=0
     for i in range(m):
         if mapping[i]==-1 and ui<len(unused):
@@ -190,11 +175,9 @@ def build_single_vehicle_steps(starts, ends, points_df: pd.DataFrame):
         cur_pt = dst_xy[mapping[nxt]]
     return order
 
-# ===================== 커버리지(덩어리) 유틸 =====================
+# ===================== 커버리지(버퍼→합집합→차집합) =====================
 def buffers_union_wgs(points: gpd.GeoDataFrame, radius_m: float):
-    """
-    points(WGS84) -> 3857 투영 → buffer → unary_union → (면적 m², WGS84 폴리곤)
-    """
+    """points(WGS84) → 3857로 투영 → buffer → unary_union → (m², WGS84 폴리곤)"""
     if points.empty: return 0.0, None
     g_m = points.to_crs(epsg=3857)
     unioned = unary_union(g_m.buffer(radius_m).values)
@@ -217,8 +200,8 @@ def coverage_metrics(existing_pts: gpd.GeoDataFrame, added_pts: gpd.GeoDataFrame
             diff_poly = None
     return base_area, prop_area, inc_area, pct, base_poly, prop_poly, diff_poly
 
-# ===================== 데이터 로드 =====================
-existing_gdf, cand_gdf, ctr_lat, ctr_lon = load_existing_and_candidates()
+# ===================== 데이터 로딩 =====================
+existing_gdf, cand_gdf, ctr_lat, ctr_lon = load_existing_candidates()
 all_points = pd.concat([existing_gdf, cand_gdf], ignore_index=True)
 
 # ===================== 상단: 노선 추천 =====================
@@ -304,13 +287,13 @@ with c3:
 
     st_folium(m, height=520, returned_objects=[], use_container_width=True, key="routing_map")
 
-# ===================== 하단: 커버리지 비교(덩어리) =====================
+# ===================== 하단: 커버리지 비교 =====================
 st.markdown('<div class="section">🗺️ 커버리지 비교 (반경 기반 · 덩어리 병합)</div>', unsafe_allow_html=True)
 colr, cola = st.columns(2)
 with colr:
     radius_m = st.slider("버퍼 반경 (m)", 50, 300, 100, 10)
 with cola:
-    st.caption("※ 면적은 3857에서 계산 (㎡), 표시는 WGS84 지도")
+    st.caption("※ 면적은 EPSG:3857에서 계산(㎡), 표시는 WGS84 지도")
 
 base_area, prop_area, inc_area, pct, base_poly, prop_poly, diff_poly = coverage_metrics(
     existing_gdf[["geometry"]], cand_gdf[["geometry"]], radius_m
