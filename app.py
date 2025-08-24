@@ -1,16 +1,15 @@
 # app.py
 # ---------------------------------------------------------
-# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드 (비교/효과 + 색상 구분 포함)
+# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드 (노선 추천 + 커버리지 비교)
 # - 데이터: new_new_drt_full_utf8.(shp/gpkg/geojson) (UTF-8)
-# - 기본 이름(name)=지번(jibun)
+# - 기본 이름(name)=지번(jibun) (없으면 자동 대체)
 # - Mapbox Directions로 실도로 라우팅
 # - 단일차량(연속 경로) 방문 순서에 숫자 아이콘 표시
-# - 중간 승차 지점 = 보라색, 첫 승차 = 빨강, 하차 = 파랑
-# - '기존 DRT 정류장'은 별도 색상/레이어로 표시
-# - 기존 vs 제안: 총 소요시간/총거리/커버리지 면적 비교
+# - 색상 규칙: 첫 승차=빨강, 중간 승차=보라, 하차=파랑
+# - 커버리지 비교: is_existing=True(기존) 전체 vs 기존+추가 전체 (반경 100m)
 # ---------------------------------------------------------
 
-import os, math
+import os, math, re
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -22,9 +21,9 @@ import streamlit as st
 import folium
 from folium.plugins import MarkerCluster
 from folium.features import DivIcon
-from streamlit_folium import st_folium
 from shapely.geometry import Point
 from shapely.ops import unary_union
+from streamlit_folium import st_folium
 
 # ===================== 기본 설정/스타일 =====================
 APP_TITLE = "천안 DRT - 맞춤형 AI기반 스마트 교통 가이드"
@@ -45,11 +44,6 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMa
 .visit-card{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border-radius:12px;padding:9px 12px;margin-bottom:8px;box-shadow:0 2px 4px rgba(102,126,234,.3)}
 .visit-num{background:#fff;color:#667eea;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.8rem}
 .empty{color:#9ca3af;background:linear-gradient(135deg,#ffecd2 0%,#fcb69f 100%);border-radius:12px;padding:20px 14px;text-align:center}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:700}
-.badge-red{background:#fee2e2;color:#b91c1c}
-.badge-purple{background:#efe5ff;color:#6d28d9}
-.badge-blue{background:#dbeafe;color:#1e40af}
-.note{font-size:.85rem;color:#6b7280;margin-top:.25rem}
 .legend-chip{display:inline-flex;align-items:center;gap:6px;margin-right:10px}
 .legend-dot{width:10px;height:10px;border-radius:50%}
 </style>
@@ -74,10 +68,10 @@ if not MAPBOX_TOKEN:
     except Exception:
         pass
 if not MAPBOX_TOKEN:
-    # 데모용(가능하면 자신의 토큰으로 교체)
+    # 데모용(가능하면 본인 토큰으로 교체)
     MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"
 
-PALETTE = ["#e74c3c","#8e44ad","#3498db","#e67e22","#16a085","#2ecc71","#1abc9c","#d35400"]
+PALETTE   = ["#e74c3c","#8e44ad","#3498db","#e67e22","#16a085","#2ecc71","#1abc9c","#d35400"]
 DATA_STEM = "new_new_drt_full_utf8"   # 데이터 파일명 앞부분
 
 # ===================== 유틸 =====================
@@ -117,21 +111,29 @@ def _open_any() -> gpd.GeoDataFrame:
             return g
     st.error(f"'{DATA_STEM}.shp/.gpkg/.geojson' 파일을 같은 폴더에 두세요."); st.stop()
 
+def infer_is_existing(df: gpd.GeoDataFrame) -> pd.Series:
+    # 1) 명시적 컬럼이 있으면 그대로 사용
+    for col in ["is_existing", "existing", "baseline", "기존여부", "기존"]:
+        if col in df.columns:
+            return df[col].astype(bool)
+    # 2) 이름 규칙으로 추론
+    return df.get("name", pd.Series([""]*len(df))).astype(str).str.contains(r"(^|\s)(기존|existing|baseline)", case=False)
+
 @st.cache_data
 def load_stops() -> gpd.GeoDataFrame:
-    g = _open_any()
+    g = _open_any().copy()
     if "jibun" not in g.columns:
         st.error("소스에 'jibun' 필드가 없습니다."); st.stop()
-    g = g.copy()
     g["jibun"] = g["jibun"].astype(str).str.strip()
     g["name"]  = g.get("name", g["jibun"]).astype(str)
     g["lon"]   = g.geometry.x; g["lat"]=g.geometry.y
+    g["is_existing"] = infer_is_existing(g)
     st.caption(f"데이터셋: {DATA_STEM} (포인트 {len(g)}개 · UTF-8)")
-    return g[["jibun","name","lon","lat","geometry"]]
+    return g[["jibun","name","lon","lat","is_existing","geometry"]]
 
 stops = load_stops()
 
-# ===================== Mapbox Directions/Isochrone =====================
+# ===================== Mapbox Directions =====================
 def mapbox_route(lon1,lat1,lon2,lat2, profile="driving", token="", timeout=12):
     if not token: raise RuntimeError("MAPBOX_TOKEN 필요")
     url=f"https://api.mapbox.com/directions/v5/mapbox/{profile}/{lon1},{lat1};{lon2},{lat2}"
@@ -144,45 +146,17 @@ def mapbox_route(lon1,lat1,lon2,lat2, profile="driving", token="", timeout=12):
         raise RuntimeError("경로가 반환되지 않았습니다.")
     rt=routes[0]; return rt["geometry"]["coordinates"], float(rt.get("duration",0.0)), float(rt.get("distance",0.0))
 
-def mapbox_isochrone_polygon(lon: float, lat: float, minutes: int = 10, profile: str = "walking", token: str = "") -> Optional[gpd.GeoDataFrame]:
-    if not token:
-        return None
-    url = f"https://api.mapbox.com/isochrone/v1/mapbox/{profile}/{lon},{lat}"
-    params = {"contours_minutes": str(minutes), "polygons": "true", "access_token": token}
-    r = requests.get(url, params=params, timeout=12)
-    if r.status_code != 200:
-        return None
-    gj = r.json()
-    if not gj.get("features"):
-        return None
-    return gpd.GeoDataFrame.from_features(gj, crs="EPSG:4326")
-
-# ===================== 커버리지(버퍼) =====================
-def union_buffer_area_km2(points_lonlat: List[Tuple[float,float]], radius_m: float) -> Tuple[gpd.GeoDataFrame, float]:
-    if not points_lonlat:
-        return gpd.GeoDataFrame(geometry=[]), 0.0
-    g = gpd.GeoDataFrame(geometry=[Point(lon, lat) for lon,lat in points_lonlat], crs="EPSG:4326").to_crs(epsg=3857)
-    bufs = g.buffer(radius_m)
-    unioned = unary_union(bufs)
-    area_km2 = (gpd.GeoSeries([unioned], crs="EPSG:3857").area.iloc[0]) / 1_000_000
-    out = gpd.GeoDataFrame(geometry=[unioned], crs="EPSG:3857").to_crs(epsg=4326)
-    return out, float(area_km2)
-
 # ===================== 단일차량(연속 경로) =====================
 def greedy_pairing(src_xy: List[Tuple[float,float]], dst_xy: List[Tuple[float,float]]) -> List[int]:
     m, n = len(src_xy), len(dst_xy)
     if n == 0: return []
-    used = set()
-    mapping = [-1]*m
+    used = set(); mapping = [-1]*m
     for i in range(m):
         dists = [(haversine(src_xy[i], dst_xy[j]), j) for j in range(n) if j not in used]
         dists.sort(key=lambda x: x[0])
         if dists:
-            j = dists[0][1]
-            mapping[i] = j
-            used.add(j)
-    unused = [j for j in range(n) if j not in used]
-    ui = 0
+            j = dists[0][1]; mapping[i] = j; used.add(j)
+    unused = [j for j in range(n) if j not in used]; ui = 0
     for i in range(m):
         if mapping[i] == -1 and ui < len(unused):
             mapping[i] = unused[ui]; ui += 1
@@ -198,50 +172,33 @@ def build_single_vehicle_steps(starts: List[str], ends: List[str]) -> List[dict]
     if not src_xy or not dst_xy:
         return []
     mapping = greedy_pairing(src_xy, dst_xy)
-    remaining = list(range(len(src_xy)))
-    order = []
-    cur_i = 0
-    remaining.remove(cur_i)
-    order += [
-        {"kind":"pickup", "name": starts[cur_i], "xy": src_xy[cur_i]},
-        {"kind":"drop",   "name": ends[mapping[cur_i]], "xy": dst_xy[mapping[cur_i]]},
-    ]
+    remaining = list(range(len(src_xy))); order=[]
+    cur_i = 0; remaining.remove(cur_i)
+    order += [{"kind":"pickup","name":starts[cur_i],"xy":src_xy[cur_i]},
+              {"kind":"drop","name":ends[mapping[cur_i]],"xy":dst_xy[mapping[cur_i]]}]
     current_point = dst_xy[mapping[cur_i]]
     while remaining:
         nxt = min(remaining, key=lambda i: haversine(current_point, src_xy[i]))
         remaining.remove(nxt)
-        order.append({"kind":"pickup", "name": starts[nxt], "xy": src_xy[nxt]})
-        order.append({"kind":"drop",   "name": ends[mapping[nxt]], "xy": dst_xy[mapping[nxt]]})
+        order.append({"kind":"pickup","name":starts[nxt],"xy":src_xy[nxt]})
+        order.append({"kind":"drop","name":ends[mapping[nxt]],"xy":dst_xy[mapping[nxt]]})
         current_point = dst_xy[mapping[nxt]]
     return order
 
-# ===================== 공통 유틸(비교 계산) =====================
-def total_route_minutes_km(order_points: List[Tuple[float,float]], profile: str, token: str) -> Tuple[float, float]:
-    if len(order_points) < 2:
-        return 0.0, 0.0
-    tot_min, tot_km = 0.0, 0.0
-    for (lon1,lat1), (lon2,lat2) in zip(order_points[:-1], order_points[1:]):
-        coords, dur, dist = mapbox_route(lon1, lat1, lon2, lat2, profile=profile, token=token)
-        tot_min += dur/60; tot_km += dist/1000
-    return tot_min, tot_km
-
-def coords_from_names(names: List[str]) -> List[Tuple[float,float]]:
-    pts = []
-    for nm in names:
-        row = stops.loc[stops["name"]==nm]
-        if not row.empty:
-            rr = row.iloc[0]; pts.append((float(rr["lon"]), float(rr["lat"])))
-    return pts
-
-def greedy_order(points: List[Tuple[float,float]]):
-    if len(points) <= 1: return points
-    remain = list(range(1, len(points)))
-    order = [0]
-    cur = 0
-    while remain:
-        nxt = min(remain, key=lambda j: haversine(points[cur], points[j]))
-        order.append(nxt); remain.remove(nxt); cur = nxt
-    return [points[i] for i in order]
+# ===================== 커버리지(100m 버퍼) 유틸 =====================
+def coverage_union_and_area(names: List[str], radius_m: int = 100):
+    """정류장 이름 리스트를 받아 반경 100m 버퍼 합집합 폴리곤과 면적(km²)을 반환"""
+    rows = stops[stops["name"].isin(names)].copy()
+    if rows.empty:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"), 0.0
+    g = gpd.GeoDataFrame(rows,
+                         geometry=gpd.points_from_xy(rows["lon"], rows["lat"]),
+                         crs="EPSG:4326").to_crs(epsg=3857)
+    bufs = g.buffer(radius_m)
+    unioned = unary_union(bufs)
+    area_km2 = gpd.GeoSeries([unioned], crs="EPSG:3857").area.iloc[0] / 1_000_000
+    out = gpd.GeoDataFrame(geometry=[unioned], crs="EPSG:3857").to_crs(epsg=4326)
+    return out, float(area_km2)
 
 # ===================== UI =====================
 col1, col2, col3 = st.columns([1.8,1.2,3.2], gap="large")
@@ -254,27 +211,14 @@ with col1:
     all_names = stops["name"].tolist()
     starts = st.multiselect("출발(승차) 정류장", all_names, key="starts")
     ends   = st.multiselect("도착(하차) 정류장", all_names, key="ends")
-
-    # 비교/효과 섹션
-    st.markdown('<div class="section-header">📈 비교/효과</div>', unsafe_allow_html=True)
-    cmp_on = st.checkbox("기존 DRT 대비 효과 계산", value=True)
-    buff_r = st.slider("커버리지 반경(버퍼·m)", 200, 1200, 500, 50)
-    use_iso = st.checkbox("보행 아이소크론(10분)으로 커버리지 계산(선택)", value=False)
-
-    baseline_names = st.multiselect("기존 DRT 정류장", all_names, help="기존 운영 기준으로 삼을 정류장들")
-
-    # 제안안 집합(현재 선택의 유니크)
-    proposed_names = sorted(set(starts + ends))
-
     route_mode = st.radio("노선 모드", ["개별쌍(모든 조합)","단일 차량(연속 경로)"], index=1)
 
     st.markdown(
         '<div class="section-header">🧭 범례</div>'
         '<span class="legend-chip"><span class="legend-dot" style="background:#e74c3c"></span>첫 승차</span>'
         '<span class="legend-chip"><span class="legend-dot" style="background:#8e44ad"></span>중간 승차</span>'
-        '<span class="legend-chip"><span class="legend-dot" style="background:#3498db"></span>하차</span>'
-        '<span class="legend-chip"><span class="legend-dot" style="background:#22c55e;border:1px solid #065f46"></span>기존 정류장</span>'
-        , unsafe_allow_html=True
+        '<span class="legend-chip"><span class="legend-dot" style="background:#3498db"></span>하차</span>',
+        unsafe_allow_html=True
     )
 
     cA, cB, cC = st.columns(3)
@@ -305,34 +249,13 @@ with col3:
     if math.isnan(ctr_lat) or math.isnan(ctr_lon): ctr_lat, ctr_lon = 36.80, 127.15
 
     m = folium.Map(location=[ctr_lat, ctr_lon], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
+    mc = MarkerCluster().add_to(m)
 
     # 모든 정류장 기본 마커(연한 회색)
-    mc_all = MarkerCluster(name="모든 정류장").add_to(m)
     for _, r in stops.iterrows():
-        folium.Marker(
-            [r["lat"], r["lon"]],
-            tooltip=str(r["name"]),
-            icon=folium.Icon(color="lightgray", icon="circle", prefix="fa")
-        ).add_to(mc_all)
+        folium.Marker([r["lat"], r["lon"]], tooltip=str(r["name"]), icon=folium.Icon(color="gray")).add_to(mc)
 
-    # 기존 DRT 정류장(요청: 다른 색으로 강조)
-    if baseline_names:
-        fg_base = folium.FeatureGroup(name="기존 DRT 정류장", show=True).add_to(m)
-        for nm in baseline_names:
-            row = stops.loc[stops["name"]==nm]
-            if row.empty: continue
-            rr = row.iloc[0]
-            # 진한 초록 원형 마커
-            folium.CircleMarker(
-                [float(rr["lat"]), float(rr["lon"])],
-                radius=7, color="#065f46", weight=2, fill=True, fill_color="#22c55e", fill_opacity=0.9,
-                tooltip=f"[기존] {nm}"
-            ).add_to(fg_base)
-
-    # 실행
-    total_min, total_km = 0.0, 0.0
-    order_names = []
-
+    # 실행 (노선 추천)
     if run_clicked:
         if not starts or not ends:
             st.warning("출발/도착 정류장을 각각 1개 이상 선택하세요.")
@@ -344,8 +267,11 @@ with col3:
                 if row.empty: return None
                 rr = row.iloc[0]; return (float(rr["lon"]), float(rr["lat"]))
 
+            total_min, total_km = 0.0, 0.0
+            order_names = []
+
             if route_mode.startswith("개별쌍"):
-                # 모든 (출발,도착) 조합 라우팅
+                # 모든 (출발,도착) 조합을 각각 라우팅
                 for i, s in enumerate(starts):
                     for j, e in enumerate(ends):
                         sxy, exy = xy(s), xy(e)
@@ -359,7 +285,6 @@ with col3:
                             order_names.append(f"{s} → {e}")
                         except Exception as e:
                             st.warning(f"{s}→{e} 실패: {e}")
-
             else:
                 # 단일 차량(연속 경로) — 숫자 아이콘 + 색상 규칙
                 steps = build_single_vehicle_steps(starts, ends)
@@ -380,9 +305,9 @@ with col3:
                 for idx, step in enumerate(steps, start=1):
                     lon, lat = step["xy"]; name = step["name"]
                     if step["kind"] == "pickup":
-                        color = "#e74c3c" if idx==1 else "#8e44ad"
+                        color = "#e74c3c" if idx==1 else "#8e44ad"  # 첫 승차=빨강, 중간 승차=보라
                     else:
-                        color = "#3498db"
+                        color = "#3498db"  # 하차=파랑
 
                     folium.Marker(
                         [lat, lon],
@@ -408,55 +333,61 @@ with col3:
             st.session_state["duration"] = total_min
             st.session_state["distance"] = total_km
 
-    # ========= 비교/효과 계산 & 지도 오버레이 =========
-    if cmp_on and baseline_names and proposed_names:
-        # 시간/거리 비교(공정 비교: 최근점 그리디 순서)
-        base_pts = coords_from_names(baseline_names)
-        prop_pts = coords_from_names(proposed_names)
-        base_seq = greedy_order(base_pts)
-        prop_seq = greedy_order(prop_pts)
-        base_min, base_km = total_route_minutes_km(base_seq, profile, MAPBOX_TOKEN)
-        prop_min, prop_km = total_route_minutes_km(prop_seq, profile, MAPBOX_TOKEN)
-
-        # 커버리지(버퍼 or 아이소크론)
-        if use_iso and MAPBOX_TOKEN:
-            def iso_union(names):
-                polys = []
-                for nm in names:
-                    row = stops.loc[stops["name"]==nm]
-                    if row.empty: continue
-                    rr = row.iloc[0]
-                    g = mapbox_isochrone_polygon(float(rr["lon"]), float(rr["lat"]), minutes=10, profile="walking", token=MAPBOX_TOKEN)
-                    if g is not None and not g.empty:
-                        polys.append(g.unary_union)
-                if polys:
-                    unioned = unary_union(polys)
-                    a_km2 = gpd.GeoSeries([unioned], crs="EPSG:4326").to_crs(epsg=3857).area.iloc[0]/1_000_000
-                    return gpd.GeoDataFrame(geometry=[unioned], crs="EPSG:4326"), float(a_km2)
-                return gpd.GeoDataFrame(geometry=[]), 0.0
-            base_cov_gdf, base_km2 = iso_union(baseline_names)
-            prop_cov_gdf, prop_km2 = iso_union(proposed_names)
-        else:
-            base_cov_gdf, base_km2 = union_buffer_area_km2(base_pts, buff_r)
-            prop_cov_gdf, prop_km2 = union_buffer_area_km2(prop_pts, buff_r)
-
-        # 메트릭
-        st.markdown("---")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("⏱️ 총 소요시간(기존→제안)", f"{base_min:.1f} → {prop_min:.1f} 분", f"{base_min - prop_min:+.1f} 분")
-        c2.metric("📏 총 이동거리(기존→제안)", f"{base_km:.2f} → {prop_km:.2f} km", f"{base_km - prop_km:+.2f} km")
-        c3.metric("🗺️ 커버리지 면적(기존→제안)", f"{base_km2:.2f} → {prop_km2:.2f} km²", f"{prop_km2 - base_km2:+.2f} km²")
-
-        # 지도 오버레이
-        try:
-            if not base_cov_gdf.empty:
-                folium.GeoJson(base_cov_gdf.__geo_interface__, name="기존 커버리지",
-                               style_function=lambda x: {"color":"#ef4444","fillColor":"#ef4444","fillOpacity":0.15, "weight":2}).add_to(m)
-            if not prop_cov_gdf.empty:
-                folium.GeoJson(prop_cov_gdf.__geo_interface__, name="제안 커버리지",
-                               style_function=lambda x: {"color":"#10b981","fillColor":"#10b981","fillOpacity":0.15, "weight":2}).add_to(m)
-            folium.LayerControl(collapsed=True).add_to(m)
-        except Exception as e:
-            st.info(f"커버리지 시각화 생략: {e}")
-
     st_folium(m, height=560, returned_objects=[], use_container_width=True, key="main_map")
+
+    # === 커버리지 비교 지도: 기존 전체 vs 기존+추가 전체 (반경 100m) ===
+    st.markdown("---")
+    st.markdown("<div class='section-header'>🗺️ 커버리지 비교 (반경 100m · 선택창과 무관 · 전체 기준)</div>", unsafe_allow_html=True)
+
+    # 1) 집합 정의 (데이터의 is_existing 기준)
+    existing_names  = stops.loc[stops["is_existing"]==True,  "name"].tolist()
+    added_names_all = stops.loc[stops["is_existing"]==False, "name"].tolist()  # 우리가 증설할 후보 전체
+    proposed_names  = sorted(set(existing_names + added_names_all))
+
+    # 2) 폴리곤/면적 계산
+    base_gdf, base_km2 = coverage_union_and_area(existing_names,  radius_m=100) if existing_names else (gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"), 0.0)
+    prop_gdf, prop_km2 = coverage_union_and_area(proposed_names, radius_m=100) if proposed_names  else (gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"), 0.0)
+
+    # 3) 메트릭: 증가분
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("기존 커버 면적", f"{base_km2:.3f} km²")
+    c2.metric("제안(기존+추가) 면적", f"{prop_km2:.3f} km²")
+    delta_area = prop_km2 - base_km2
+    c3.metric("면적 증가", f"{delta_area:+.3f} km²")
+    inc_rate = (delta_area / base_km2 * 100) if base_km2 > 0 else 0.0
+    c4.metric("증가율", f"{inc_rate:+.1f}%")
+
+    # 4) 전용 지도 렌더링 (선택창과 무관)
+    m2 = folium.Map(location=[ctr_lat, ctr_lon], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
+
+    # 기존/추가 마커(옵션): 전체 분포가 보이도록 색 구분
+    fg_exist = folium.FeatureGroup(name="기존 정류장", show=False).add_to(m2)
+    for _, r in stops[stops["is_existing"]==True].iterrows():
+        folium.CircleMarker(
+            [float(r["lat"]), float(r["lon"])],
+            radius=5, color="#065f46", weight=1.5, fill=True, fill_color="#22c55e", fill_opacity=0.9,
+            tooltip=f"[기존] {r['name']}"
+        ).add_to(fg_exist)
+
+    fg_added = folium.FeatureGroup(name="추가 정류장", show=False).add_to(m2)
+    for _, r in stops[stops["is_existing"]==False].iterrows():
+        folium.CircleMarker(
+            [float(r["lat"]), float(r["lon"])],
+            radius=5, color="#4c1d95", weight=1.5, fill=True, fill_color="#8e44ad", fill_opacity=0.9,
+            tooltip=f"[추가] {r['name']}"
+        ).add_to(fg_added)
+
+    # 커버 폴리곤: 기존=빨강, 제안=초록
+    if not base_gdf.empty:
+        folium.GeoJson(
+            base_gdf.__geo_interface__, name="기존 커버(100m)",
+            style_function=lambda x: {"color":"#ef4444","fillColor":"#ef4444","fillOpacity":0.15,"weight":2}
+        ).add_to(m2)
+    if not prop_gdf.empty:
+        folium.GeoJson(
+            prop_gdf.__geo_interface__, name="제안 커버(100m)",
+            style_function=lambda x: {"color":"#10b981","fillColor":"#10b981","fillOpacity":0.15,"weight":2}
+        ).add_to(m2)
+
+    folium.LayerControl(collapsed=True).add_to(m2)
+    st_folium(m2, height=520, returned_objects=[], use_container_width=True, key="coverage_map_all_100m")
