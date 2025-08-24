@@ -26,6 +26,19 @@ import streamlit as st
 # ==== 강제 우회: GeoPandas read_file에서 engine='fiona' 무시 + pyogrio로 처리 ====
 import os, sys, inspect
 import streamlit as st
+import os, sys, inspect, streamlit as st, geopandas as gpd
+
+# ---- 런타임 경로/버전 확인 ----
+st.write("📝 RUNNING FILE :", os.path.abspath(__file__))
+st.write("🧭 CWD          :", os.getcwd())
+st.write("🐍 Python      :", sys.version.split()[0])
+st.write("📦 GeoPandas   :", gpd.__version__)
+try:
+    import pyogrio
+    st.write("📦 pyogrio     :", pyogrio.__version__)
+except Exception as e:
+    st.error(f"pyogrio 미탑재: {e}")
+
 
 # (선택) 완전 초기화 버튼
 with st.sidebar:
