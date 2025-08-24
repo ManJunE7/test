@@ -1,12 +1,10 @@
 # app.py
 # ---------------------------------------------------------
-# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드
-# (노선 추천 + 커버리지 비교(기존 SHP 사용))
-#
+# 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드 (통합판)
+# - 라우팅(개별쌍/단일차량) + 커버리지 비교(반경 100m)
 # - 기존 DRT:  천안콜 버스 정류장(v250730)_4326.shp  (WGS84, EPSG:4326)
-# - 후보(추가) DRT: new_new_drt_full_utf8.(shp/gpkg/geojson)  (WGS84, EPSG:4326)
-# - 라우팅: Mapbox Directions (선택)
-# - 커버리지: 반경 100m 버퍼의 합집합 면적(km²) 비교
+# - 후보(추가) DRT: new_new_drt_full_utf8.(shp/gpkg/geojson) (WGS84, EPSG:4326)
+# - SHP 인코딩 자동 판별(UTF-8/CP949/EUC-KR 등) 폴백 지원
 # ---------------------------------------------------------
 
 import os, math
@@ -24,12 +22,9 @@ from folium.plugins import MarkerCluster
 from folium.features import DivIcon
 from streamlit_folium import st_folium
 
-# ===================== 경로/상수 =====================
-# 기존 DRT 정류장(업로드한 shapefile)
-EXISTING_SHP = "천안콜 버스 정류장(v250730)_4326.shp"   # 같은 폴더에 두세요 (EPSG:4326)
-
-# 후보(추가) 정류장 데이터 파일명(확장자 자동 탐색: shp/gpkg/geojson)
-CANDIDATE_STEM = "new_new_drt_full_utf8"
+# ===================== 파일 경로/상수 =====================
+EXISTING_SHP = "천안콜 버스 정류장(v250730)_4326.shp"  # 기존 DRT shapefile (동일 폴더)
+CANDIDATE_STEM = "new_new_drt_full_utf8"               # 후보 DRT 데이터의 파일명 앞부분
 
 # Mapbox 토큰(환경변수/Secrets/직접입력 순으로 조회)
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
@@ -38,9 +33,8 @@ if not MAPBOX_TOKEN:
         MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
     except Exception:
         pass
-
-# 데모용(가능하면 본인 토큰으로 교체)
 if not MAPBOX_TOKEN:
+    # 데모용 공개 토큰 (가능하면 본인 토큰으로 교체)
     MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"
 
 PALETTE = ["#e74c3c","#8e44ad","#3498db","#e67e22","#16a085","#2ecc71","#1abc9c","#d35400"]
@@ -61,38 +55,54 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMa
 .empty{color:#9ca3af;background:linear-gradient(135deg,#ffecd2 0%,#fcb69f 100%);border-radius:12px;padding:18px 12px;text-align:center}
 </style>
 """, unsafe_allow_html=True)
-
 st.markdown('<div class="header"><div class="title">천안 DRT - 맞춤형 AI기반 스마트 교통 가이드</div></div>', unsafe_allow_html=True)
 
-# ===================== 공용 유틸 =====================
-def read_any_vector(path_stem: str) -> gpd.GeoDataFrame:
-    """stem을 받아 .shp/.gpkg/.geojson 중 존재하는 것 읽기"""
-    for ext in (".shp", ".gpkg", ".geojson"):
-        p = Path(f"./{path_stem}{ext}")
-        if p.exists():
-            g = gpd.read_file(p)
-            try:
-                if g.crs and g.crs.to_epsg() != 4326:
-                    g = g.to_crs(epsg=4326)
-            except Exception:
-                pass
-            # 포인트가 아니면 대표점 사용
-            if not g.geom_type.astype(str).str.contains("Point", case=False, na=False).any():
-                g = g.copy(); g["geometry"] = g.geometry.representative_point()
-            return g
-    st.error(f"'{path_stem}.shp/.gpkg/.geojson' 파일을 같은 폴더에 두세요."); st.stop()
+# ===================== 견고한 SHP 로더 (인코딩 폴백) =====================
+def read_shp_robust(path: str) -> gpd.GeoDataFrame:
+    """
+    SHP 인코딩 문제를 최대한 피해서 읽는다.
+    시도 순서:
+      1) 기본 gpd.read_file (pyogrio가 .cpg 참고 시 OK)
+      2) fiona + encoding='utf-8' / 'cp949' / 'euc-kr'
+      3) SHAPE_ENCODING 환경변수 강제 후 fiona
+    """
+    # 1) 기본
+    try:
+        return gpd.read_file(path)
+    except Exception:
+        pass
 
+    # 2) fiona + encoding 후보
+    for enc in ["utf-8", "cp949", "euc-kr"]:
+        try:
+            return gpd.read_file(path, engine="fiona", encoding=enc)
+        except Exception:
+            continue
+
+    # 3) SHAPE_ENCODING 강제
+    for env_enc in ["UTF-8", "CP949", "EUC-KR"]:
+        try:
+            os.environ["SHAPE_ENCODING"] = env_enc
+            return gpd.read_file(path, engine="fiona")
+        except Exception:
+            continue
+
+    raise RuntimeError(f"SHP 인코딩 자동판별 실패: {path}")
+
+# ===================== 데이터 로더 =====================
 def read_existing_shp(path: str) -> gpd.GeoDataFrame:
     p = Path(path)
     if not p.exists():
-        st.error(f"기존 DRT shapefile이 보이지 않습니다: {path}")
+        st.error(f"기존 DRT shapefile을 찾을 수 없습니다: {path}")
         st.stop()
-    g = gpd.read_file(p)
+
+    g = read_shp_robust(str(p))
     try:
         if g.crs and g.crs.to_epsg() != 4326:
             g = g.to_crs(epsg=4326)
     except Exception:
         pass
+
     # 이름 컬럼 추정(없으면 자동 생성)
     name_col = None
     for c in ["정류장명", "정류소명", "name", "NAME", "정류장", "정류소"]:
@@ -107,6 +117,29 @@ def read_existing_shp(path: str) -> gpd.GeoDataFrame:
     g["lat"] = g.geometry.y
     return g[["name","lon","lat","geometry"]]
 
+def read_any_vector(path_stem: str) -> gpd.GeoDataFrame:
+    """stem을 받아 .shp/.gpkg/.geojson 중 존재하는 것 읽기 (SHP는 robust)"""
+    for ext in (".shp", ".gpkg", ".geojson"):
+        p = Path(f"./{path_stem}{ext}")
+        if p.exists():
+            if ext == ".shp":
+                g = read_shp_robust(str(p))
+            else:
+                g = gpd.read_file(p)
+
+            try:
+                if g.crs and g.crs.to_epsg() != 4326:
+                    g = g.to_crs(epsg=4326)
+            except Exception:
+                pass
+
+            # 포인트가 아니면 대표점 사용
+            if not g.geom_type.astype(str).str.contains("Point", case=False, na=False).any():
+                g = g.copy(); g["geometry"] = g.geometry.representative_point()
+            return g
+    st.error(f"'{path_stem}.shp/.gpkg/.geojson' 파일을 같은 폴더에 두세요."); st.stop()
+
+# ===================== 공용 유틸 =====================
 def haversine(xy1, xy2):
     R=6371000.0
     lon1,lat1,lon2,lat2 = map(np.radians,[xy1[0],xy1[1],xy2[0],xy2[1]])
@@ -163,7 +196,7 @@ def build_single_vehicle_steps(starts: List[str], ends: List[str], stops_df: pd.
     return order
 
 def coverage_union_and_area(points_gdf: gpd.GeoDataFrame, radius_m: int = 100):
-    """포인트 GeoDataFrame을 받아 반경 radius_m 버퍼 합집합과 면적(km²) 반환"""
+    """포인트 GDF의 반경 radius_m 버퍼 합집합과 면적(km²) 반환"""
     if points_gdf.empty:
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"), 0.0
     g = points_gdf.to_crs(epsg=3857)
@@ -172,7 +205,7 @@ def coverage_union_and_area(points_gdf: gpd.GeoDataFrame, radius_m: int = 100):
     out = gpd.GeoDataFrame(geometry=[unioned], crs="EPSG:3857").to_crs(epsg=4326)
     return out, float(area_km2)
 
-# ===================== 데이터 로드 =====================
+# ===================== 데이터 로드 (캐시) =====================
 @st.cache_data
 def load_existing_candidates():
     existing = read_existing_shp(EXISTING_SHP)  # 기존 DRT
@@ -181,7 +214,8 @@ def load_existing_candidates():
     if "jibun" in cand.columns and "name" not in cand.columns:
         cand["name"] = cand["jibun"].astype(str)
     else:
-        cand["name"] = cand.get("name", cand.get("jibun", pd.Series([f"후보_{i+1}" for i in range(len(cand))]))).astype(str)
+        base = cand.get("name", cand.get("jibun", pd.Series([f"후보_{i+1}" for i in range(len(cand))])))
+        cand["name"] = base.astype(str)
     cand["lon"] = cand.geometry.x
     cand["lat"] = cand.geometry.y
     cand = cand[["name","lon","lat","geometry"]]
@@ -189,7 +223,7 @@ def load_existing_candidates():
 
 existing_gdf, cand_gdf = load_existing_candidates()
 
-# ===================== 라우팅/경로 추천 (후보 데이터 기준) =====================
+# ===================== 라우팅/노선 추천 =====================
 st.markdown('<div class="section">🚏 노선 추천</div>', unsafe_allow_html=True)
 c1, c2, c3 = st.columns([1.8,1.2,3.2], gap="large")
 
@@ -222,7 +256,6 @@ with c2:
     st.metric("이동거리(합)", f"{st.session_state.get('distance', 0.0):.2f}km")
 
 with c3:
-    # 지도
     ctr_lat = float(cand_gdf["lat"].mean()) if len(cand_gdf) else float(existing_gdf["lat"].mean())
     ctr_lon = float(cand_gdf["lon"].mean()) if len(cand_gdf) else float(existing_gdf["lon"].mean())
     if math.isnan(ctr_lat) or math.isnan(ctr_lon): ctr_lat, ctr_lon = 36.80, 127.15
@@ -238,11 +271,11 @@ with c3:
         elif not MAPBOX_TOKEN:
             st.error("MAPBOX_TOKEN을 설정하세요.")
         else:
-            # 라우팅
             def xy_from(df, nm):
                 row = df.loc[df["name"]==nm]
                 if row.empty: return None
                 rr = row.iloc[0]; return (float(rr["lon"]), float(rr["lat"]))
+
             total_min, total_km = 0.0, 0.0
             order_names = []
 
@@ -290,21 +323,18 @@ with c3:
 
     st_folium(m, height=510, returned_objects=[], use_container_width=True, key="routing_map")
 
-# ===================== 커버리지 비교(선택과 무관, 전체 기준) =====================
-st.markdown('<div class="section">🗺️ 커버리지 비교 (반경 100m · 전체 기준)</div>', unsafe_allow_html=True)
+# ===================== 커버리지 비교(기존 전체 vs 기존+후보 전체) =====================
+st.markdown('<div class="section">🗺️ 커버리지 비교 (반경 100m · 선택과 무관, 전체 기준)</div>', unsafe_allow_html=True)
 
-# 반경 조정 가능 (기본 100m)
 radius_m = st.slider("커버리지 반경(미터)", min_value=50, max_value=300, value=100, step=10)
 
-# 1) 기존/후보 포인트 준비 (이미 WGS84)
 exist_pts = existing_gdf[["name","lon","lat","geometry"]].copy()
 cand_pts  = cand_gdf[["name","lon","lat","geometry"]].copy()
 
-# 2) 면적 계산
 base_poly, base_km2 = coverage_union_and_area(exist_pts, radius_m=radius_m)
-prop_poly, prop_km2 = coverage_union_and_area(pd.concat([exist_pts, cand_pts], ignore_index=True), radius_m=radius_m)
+prop_poly, prop_km2 = coverage_union_and_area(pd.concat([exist_pts, cand_pts], ignore_index=True),
+                                              radius_m=radius_m)
 
-# 3) 메트릭
 mc1, mc2, mc3, mc4 = st.columns(4)
 mc1.metric("기존 커버 면적", f"{base_km2:.3f} km²")
 mc2.metric("제안(기존+추가) 면적", f"{prop_km2:.3f} km²")
@@ -313,12 +343,12 @@ mc3.metric("면적 증가", f"{delta_area:+.3f} km²")
 inc_rate = (delta_area / base_km2 * 100) if base_km2 > 0 else 0.0
 mc4.metric("증가율", f"{inc_rate:+.1f}%")
 
-# 4) 지도 표시 (기존=빨강, 추가=파랑, 폴리곤: 기존=빨강, 제안=초록)
 ctr_lat2 = float(pd.concat([exist_pts["lat"], cand_pts["lat"]]).mean())
 ctr_lon2 = float(pd.concat([exist_pts["lon"], cand_pts["lon"]]).mean())
 if math.isnan(ctr_lat2) or math.isnan(ctr_lon2): ctr_lat2, ctr_lon2 = 36.80, 127.15
 
 m2 = folium.Map(location=[ctr_lat2, ctr_lon2], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
+
 fg_exist = folium.FeatureGroup(name="기존 정류장", show=False).add_to(m2)
 for _, r in exist_pts.iterrows():
     folium.CircleMarker([r["lat"], r["lon"]], radius=5, color="#b91c1c", fill=True, fill_color="#ef4444",
@@ -329,10 +359,10 @@ for _, r in cand_pts.iterrows():
                         fill_opacity=0.9, tooltip=f"[후보] {r['name']}").add_to(fg_cand)
 
 if not base_poly.empty:
-    folium.GeoJson(base_poly.__geo_interface__, name="기존 커버", 
+    folium.GeoJson(base_poly.__geo_interface__, name="기존 커버",
                    style_function=lambda x: {"color":"#ef4444","fillColor":"#ef4444","fillOpacity":0.15,"weight":2}).add_to(m2)
 if not prop_poly.empty:
-    folium.GeoJson(prop_poly.__geo_interface__, name="제안 커버", 
+    folium.GeoJson(prop_poly.__geo_interface__, name="제안 커버",
                    style_function=lambda x: {"color":"#10b981","fillColor":"#10b981","fillOpacity":0.15,"weight":2}).add_to(m2)
 
 folium.LayerControl(collapsed=True).add_to(m2)
