@@ -366,5 +366,5 @@ if not prop_poly.empty:
                    style_function=lambda x: {"color":"#10b981","fillColor":"#10b981","fillOpacity":0.15,"weight":2}).add_to(m2)
 
 folium.LayerControl(collapsed=True).add_to(m2)
-st.folium(m2, height=560, use_container_width=True, key="coverage_map_all")
+st_folium(m2, height=560, returned_objects=[], use_container_width=True, key="coverage_map_all")
 
