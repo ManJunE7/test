@@ -7,6 +7,7 @@
 # - 후보(추가) DRT: new_new_drt_full_utf8.(shp/gpkg/geojson)  (WGS84, EPSG:4326)
 # - 라우팅: Mapbox Directions
 # - 커버리지: 반경 버퍼(기본 100m) 합집합 면적(km²) 비교 + 폴리곤 시각화
+# - 권장 차량 수: 총 소요시간을 30분 단위로 올림(ceil)
 # ---------------------------------------------------------
 
 import os, math
@@ -27,6 +28,9 @@ from streamlit_folium import st_folium
 # ===================== 경로/상수 =====================
 EXISTING_SHP   = "천안콜 버스 정류장(v250730)_4326.shp"   # 같은 폴더에 두세요 (EPSG:4326)
 CANDIDATE_STEM = "new_new_drt_full_utf8"                  # .shp/.gpkg/.geojson 중 하나
+
+# 권장 차량 수 계산 기준(분)
+TIME_LIMIT_MIN = 30
 
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
@@ -54,6 +58,7 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMa
 .visit-card{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border-radius:12px;padding:8px 10px;margin-bottom:6px}
 .visit-num{background:#fff;color:#667eea;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.75rem}
 .empty{color:#9ca3af;background:linear-gradient(135deg,#ffecd2 0%,#fcb69f 100%);border-radius:12px;padding:18px 12px;text-align:center}
+.badgeGreen{background:#dcfce7;color:#166534;border-radius:999px;padding:2px 8px;font-weight:700;font-size:.8rem;margin-left:6px}
 </style>
 """, unsafe_allow_html=True)
 st.markdown('<div class="header"><div class="title">천안 DRT - 맞춤형 AI기반 스마트 교통 가이드</div></div>', unsafe_allow_html=True)
@@ -282,6 +287,10 @@ with c2:
         st.markdown('<div class="empty">경로 생성 후 표시됩니다</div>', unsafe_allow_html=True)
     st.metric("소요시간(합)", f"{st.session_state.get('duration', 0.0):.1f}분")
     st.metric("이동거리(합)", f"{st.session_state.get('distance', 0.0):.2f}km")
+    # ★ 권장 차량 수 표기
+    fleet_val = st.session_state.get("fleet", 0)
+    if fleet_val:
+        st.markdown(f"<span class='badgeGreen'>권장 차량 수: {fleet_val}대 (기준 {TIME_LIMIT_MIN}분)</span>", unsafe_allow_html=True)
 
 with c3:
     ctr_lat = float(cand_gdf["lat"].mean()) if len(cand_gdf) else float(existing_gdf["lat"].mean())
@@ -345,9 +354,16 @@ with c3:
                             st.warning(f"세그먼트 {idx-1}→{idx} 실패: {e}")
                     prev = (lon, lat); order_names.append(name)
 
+            # 세션에 결과 저장
             st.session_state["order"]    = order_names
             st.session_state["duration"] = total_min
             st.session_state["distance"] = total_km
+
+            # ★ 권장 차량 수 계산: ceil(총 소요시간 / 30분)
+            if total_min > 0:
+                st.session_state["fleet"] = max(1, math.ceil(total_min / TIME_LIMIT_MIN))
+            else:
+                st.session_state["fleet"] = 1
 
     st_folium(m, height=510, returned_objects=[], use_container_width=True, key="routing_map")
 
@@ -399,3 +415,4 @@ if not prop_poly.empty:
 
 folium.LayerControl(collapsed=True).add_to(m2)
 st_folium(m2, height=560, returned_objects=[], use_container_width=True, key="coverage_map_all")
+
