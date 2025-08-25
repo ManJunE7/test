@@ -7,7 +7,7 @@
 # - 후보(추가) DRT: new_new_drt_full_utf8.(shp/gpkg/geojson)  (WGS84, EPSG:4326)
 # - 라우팅: Mapbox Directions
 # - 커버리지: 반경 버퍼(기본 100m) 합집합 면적(km²) 비교 + 폴리곤 시각화
-# - 권장 차량 수: 총 소요시간을 30분 단위로 올림(ceil)
+# - 지도: 정류장에는 숫자 표시 X (회색 점만), 방문 순서에만 숫자 배지
 # ---------------------------------------------------------
 
 import os, math
@@ -21,7 +21,6 @@ from shapely.ops import unary_union
 import requests
 import streamlit as st
 import folium
-from folium.plugins import MarkerCluster
 from folium.features import DivIcon
 from streamlit_folium import st_folium
 
@@ -29,18 +28,15 @@ from streamlit_folium import st_folium
 EXISTING_SHP   = "천안콜 버스 정류장(v250730)_4326.shp"   # 같은 폴더에 두세요 (EPSG:4326)
 CANDIDATE_STEM = "new_new_drt_full_utf8"                  # .shp/.gpkg/.geojson 중 하나
 
-# 권장 차량 수 계산 기준(분)
-TIME_LIMIT_MIN = 30
-
-MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
+# << 직접 입력(추천)하거나 secrets/env 에서 읽도록 비워두세요 >>
+MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"  # 예: "pk.XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+if not MAPBOX_TOKEN:
+    MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 if not MAPBOX_TOKEN:
     try:
         MAPBOX_TOKEN = st.secrets["MAPBOX_TOKEN"]
     except Exception:
         pass
-if not MAPBOX_TOKEN:
-    # 데모용 토큰 (가능하면 본인 토큰으로 교체)
-    MAPBOX_TOKEN = "pk.eyJ1IjoiZ3VyMDUxMDgiLCJhIjoiY21lbWppYjByMDV2ajJqcjQyYXUxdzY3byJ9.yLBRJK_Ib6W3p9f16YlIKQ"
 
 PALETTE = ["#e74c3c","#8e44ad","#3498db","#e67e22","#16a085","#2ecc71","#1abc9c","#d35400"]
 
@@ -58,7 +54,6 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMa
 .visit-card{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border-radius:12px;padding:8px 10px;margin-bottom:6px}
 .visit-num{background:#fff;color:#667eea;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.75rem}
 .empty{color:#9ca3af;background:linear-gradient(135deg,#ffecd2 0%,#fcb69f 100%);border-radius:12px;padding:18px 12px;text-align:center}
-.badgeGreen{background:#dcfce7;color:#166534;border-radius:999px;padding:2px 8px;font-weight:700;font-size:.8rem;margin-left:6px}
 </style>
 """, unsafe_allow_html=True)
 st.markdown('<div class="header"><div class="title">천안 DRT - 맞춤형 AI기반 스마트 교통 가이드</div></div>', unsafe_allow_html=True)
@@ -206,6 +201,7 @@ def greedy_pairing(src_xy: List[Tuple[float,float]], dst_xy: List[Tuple[float,fl
     return mapping
 
 def build_single_vehicle_steps(starts: List[str], ends: List[str], stops_df: pd.DataFrame) -> List[dict]:
+    """한 대 차량이 '승차→하차'를 반복하며 연속 경로를 만드는 단계 리스트"""
     def xy(label):
         r = stops_df.loc[stops_df["name"]==label]
         if r.empty: return None
@@ -287,20 +283,26 @@ with c2:
         st.markdown('<div class="empty">경로 생성 후 표시됩니다</div>', unsafe_allow_html=True)
     st.metric("소요시간(합)", f"{st.session_state.get('duration', 0.0):.1f}분")
     st.metric("이동거리(합)", f"{st.session_state.get('distance', 0.0):.2f}km")
-    # ★ 권장 차량 수 표기
-    fleet_val = st.session_state.get("fleet", 0)
-    if fleet_val:
-        st.markdown(f"<span class='badgeGreen'>권장 차량 수: {fleet_val}대 (기준 {TIME_LIMIT_MIN}분)</span>", unsafe_allow_html=True)
 
 with c3:
     ctr_lat = float(cand_gdf["lat"].mean()) if len(cand_gdf) else float(existing_gdf["lat"].mean())
     ctr_lon = float(cand_gdf["lon"].mean()) if len(cand_gdf) else float(existing_gdf["lon"].mean())
     if math.isnan(ctr_lat) or math.isnan(ctr_lon): ctr_lat, ctr_lon = 36.80, 127.15
 
+    # === 클러스터 제거 / 회색 점만 ===
     m = folium.Map(location=[ctr_lat, ctr_lon], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
-    mc = MarkerCluster().add_to(m)
+    fg_stops = folium.FeatureGroup(name=f"후보 정류장({len(cand_gdf)})", show=True).add_to(m)
     for _, r in cand_gdf.iterrows():
-        folium.Marker([r["lat"], r["lon"]], tooltip=f"[후보]{r['name']}", icon=folium.Icon(color="gray")).add_to(mc)
+        folium.CircleMarker(
+            [r["lat"], r["lon"]],
+            radius=4,
+            color="#666",
+            weight=1,
+            fill=True,
+            fill_color="#777",
+            fill_opacity=0.9,
+            tooltip=str(r["name"])  # 필요 없으면 제거 가능
+        ).add_to(fg_stops)
 
     if b_run:
         if not starts or not ends:
@@ -316,13 +318,22 @@ with c3:
             total_min, total_km = 0.0, 0.0
             order_names = []
 
+            # 번호 배지 (순서용)
+            def badge(n, color):
+                return ("<div style='background:"+color+";color:#fff;"
+                        "border:2px solid #fff;border-radius:50%;width:30px;height:30px;"
+                        "line-height:30px;text-align:center;font-weight:800;"
+                        "box-shadow:0 2px 6px rgba(0,0,0,.35);font-size:13px;'>"+str(n)+"</div>")
+
             if route_mode.startswith("개별쌍"):
+                # 모든 조합을 개별 경로로 그리되, 방문 숫자는 표시하지 않음(원한다면 추가 가능)
                 for i, s in enumerate(starts):
                     for j, e in enumerate(ends):
                         sxy, exy = xy_from(cand_gdf, s), xy_from(cand_gdf, e)
                         if not sxy or not exy: continue
                         try:
-                            coords, dur, dist = mapbox_route(sxy[0], sxy[1], exy[0], exy[1], profile=profile, token=MAPBOX_TOKEN)
+                            coords, dur, dist = mapbox_route(sxy[0], sxy[1], exy[0], exy[1],
+                                                             profile=profile, token=MAPBOX_TOKEN)
                             ll = [(c[1], c[0]) for c in coords]
                             folium.PolyLine(ll, color=PALETTE[(i+j) % len(PALETTE)], weight=5, opacity=0.9).add_to(m)
                             total_min += dur/60; total_km += dist/1000
@@ -330,23 +341,25 @@ with c3:
                         except Exception as e:
                             st.warning(f"{s}→{e} 실패: {e}")
             else:
+                # 단일 차량(연속 경로) — 방문 순서마다 번호 배지 표시
                 steps = build_single_vehicle_steps(starts, ends, cand_gdf)
-
-                def badge(n, color):
-                    return ("<div style='background:"+color+";color:#fff;"
-                            "border:2px solid #fff;border-radius:50%;width:30px;height:30px;"
-                            "line-height:30px;text-align:center;font-weight:800;"
-                            "box-shadow:0 2px 6px rgba(0,0,0,.35);font-size:13px;'>"+str(n)+"</div>")
 
                 prev = None
                 for idx, step in enumerate(steps, start=1):
                     lon, lat = step["xy"]; name = step["name"]
+                    # 첫 승차=빨강, 중간 승차=보라, 하차=파랑
                     color = "#e74c3c" if (step["kind"]=="pickup" and idx==1) else ("#8e44ad" if step["kind"]=="pickup" else "#3498db")
-                    folium.Marker([lat, lon], tooltip=f"{idx}. {step['kind']} : {name}",
-                                  icon=DivIcon(html=badge(idx, color))).add_to(m)
+                    folium.Marker(
+                        [lat, lon],
+                        tooltip=f"{idx}. {step['kind']} : {name}",
+                        icon=DivIcon(html=badge(idx, color)),
+                        z_index_offset=1000
+                    ).add_to(m)
+
                     if prev is not None:
                         try:
-                            coords, dur, dist = mapbox_route(prev[0], prev[1], lon, lat, profile=profile, token=MAPBOX_TOKEN)
+                            coords, dur, dist = mapbox_route(prev[0], prev[1], lon, lat,
+                                                             profile=profile, token=MAPBOX_TOKEN)
                             ll = [(c[1], c[0]) for c in coords]
                             folium.PolyLine(ll, color=PALETTE[(idx-1) % len(PALETTE)], weight=5, opacity=0.9).add_to(m)
                             total_min += dur/60; total_km += dist/1000
@@ -354,16 +367,9 @@ with c3:
                             st.warning(f"세그먼트 {idx-1}→{idx} 실패: {e}")
                     prev = (lon, lat); order_names.append(name)
 
-            # 세션에 결과 저장
             st.session_state["order"]    = order_names
             st.session_state["duration"] = total_min
             st.session_state["distance"] = total_km
-
-            # ★ 권장 차량 수 계산: ceil(총 소요시간 / 30분)
-            if total_min > 0:
-                st.session_state["fleet"] = max(1, math.ceil(total_min / TIME_LIMIT_MIN))
-            else:
-                st.session_state["fleet"] = 1
 
     st_folium(m, height=510, returned_objects=[], use_container_width=True, key="routing_map")
 
@@ -415,4 +421,3 @@ if not prop_poly.empty:
 
 folium.LayerControl(collapsed=True).add_to(m2)
 st_folium(m2, height=560, returned_objects=[], use_container_width=True, key="coverage_map_all")
-
