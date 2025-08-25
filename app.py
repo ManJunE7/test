@@ -1,8 +1,7 @@
 # app.py
 # ---------------------------------------------------------
 # 천안 DRT - 맞춤형 AI기반 스마트 교통 가이드
-# (노선 추천 + 커버리지 비교(기존 SHP), pyogrio 경로)
-# - 위 지도: 정류장(회색 점) 레이어 ON/OFF 버튼 추가
+# (노선 추천 + 커버리지 비교(버퍼/컨벡스헐 토글), pyogrio 경로)
 # ---------------------------------------------------------
 
 import os, math
@@ -13,6 +12,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.ops import unary_union
+from shapely.geometry import MultiPoint
 import requests
 import streamlit as st
 import folium
@@ -70,11 +70,11 @@ def read_shp_with_encoding(path: Path) -> gpd.GeoDataFrame:
     except Exception:
         st.error("pyogrio가 필요합니다. requirements.txt에 'pyogrio' 추가")
         raise
-    encs = []
+    encs=[]
     try:
-        cpg = path.with_suffix(".cpg")
+        cpg=path.with_suffix(".cpg")
         if cpg.exists():
-            enc = cpg.read_text(encoding="ascii", errors="ignore").strip()
+            enc=cpg.read_text(encoding="ascii", errors="ignore").strip()
             if enc: encs.append(enc.lower())
     except Exception:
         pass
@@ -83,8 +83,8 @@ def read_shp_with_encoding(path: Path) -> gpd.GeoDataFrame:
     last=None
     for enc in encs:
         try:
-            g = pio(path, encoding=enc)
-            return gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g, "crs", None))
+            g=pio(path, encoding=enc)
+            return gpd.GeoDataFrame(g, geometry="geometry", crs=getattr(g,"crs",None))
         except Exception as e:
             last=e
     st.error(f"Shapefile 인코딩 실패: {path.name} (시도: {encs})")
@@ -93,9 +93,9 @@ def read_shp_with_encoding(path: Path) -> gpd.GeoDataFrame:
 
 def read_any_vector(stem: str) -> gpd.GeoDataFrame:
     for ext in (".shp",".gpkg",".geojson"):
-        p = Path(f"./{stem}{ext}")
+        p=Path(f"./{stem}{ext}")
         if p.exists():
-            g = read_shp_with_encoding(p) if ext==".shp" else gpd.read_file(p)
+            g=read_shp_with_encoding(p) if ext==".shp" else gpd.read_file(p)
             try:
                 if g.crs and g.crs.to_epsg()!=4326: g=g.to_crs(epsg=4326)
             except Exception: pass
@@ -108,7 +108,7 @@ def read_existing_shp(path: str) -> gpd.GeoDataFrame:
     p=Path(path)
     if not p.exists():
         st.error(f"기존 DRT 파일 없음: {path}"); st.stop()
-    g = read_shp_with_encoding(p) if p.suffix.lower()==".shp" else gpd.read_file(p)
+    g=read_shp_with_encoding(p) if p.suffix.lower()==".shp" else gpd.read_file(p)
     try:
         if g.crs and g.crs.to_epsg()!=4326: g=g.to_crs(epsg=4326)
     except Exception: pass
@@ -176,14 +176,28 @@ def build_single_vehicle_steps(starts: List[str], ends: List[str], stops_df: pd.
         cur_pt=dst_xy[mapping[nxt]]
     return order
 
-# ===================== 커버리지 =====================
-def coverage_union_and_area(points_gdf: gpd.GeoDataFrame, radius_m: int = 100):
+# ===================== 커버리지 계산(버퍼/컨벡스헐) =====================
+def coverage_region(points_gdf: gpd.GeoDataFrame, mode: str = "buffer", radius_m: int = 100):
+    """
+    mode='buffer'  -> 포인트를 3857에서 r(m) 버퍼 후 unary_union
+    mode='hull'    -> 포인트의 convex hull(최소 볼록 외피)
+    반환: (WGS84 폴리곤 GeoDataFrame, 면적 km²)
+    """
     if points_gdf.empty:
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"), 0.0
+
     g = points_gdf.to_crs(epsg=3857)
-    unioned = unary_union(g.buffer(radius_m))
-    area_km2 = float(gpd.GeoSeries([unioned], crs="EPSG:3857").area.iloc[0] / 1_000_000)
-    out = gpd.GeoDataFrame(geometry=[unioned], crs="EPSG:3857").to_crs(epsg=4326)
+
+    if mode == "hull":
+        hull = MultiPoint(list(g.geometry)).convex_hull
+        geom_3857 = hull
+    else:
+        geom_3857 = unary_union(g.buffer(radius_m))
+
+    # 면적(km²)
+    area_km2 = float(gpd.GeoSeries([geom_3857], crs="EPSG:3857").area.iloc[0] / 1_000_000)
+    # 시각화용(WGS84)
+    out = gpd.GeoDataFrame(geometry=[geom_3857], crs="EPSG:3857").to_crs(epsg=4326)
     return out, area_km2
 
 # ===================== 데이터 로드 =====================
@@ -201,7 +215,7 @@ def load_existing_candidates():
 
 existing_gdf, cand_gdf = load_existing_candidates()
 
-# ===================== 라우팅/경로 추천 =====================
+# ===================== 라우팅/지도(위) =====================
 st.markdown('<div class="section">🚏 노선 추천</div>', unsafe_allow_html=True)
 c1, c2, c3 = st.columns([1.8,1.2,3.2], gap="large")
 
@@ -238,12 +252,10 @@ with c3:
     ctr_lon = float(cand_gdf["lon"].mean()) if len(cand_gdf) else float(existing_gdf["lon"].mean())
     if math.isnan(ctr_lat) or math.isnan(ctr_lon): ctr_lat, ctr_lon = 36.80, 127.15
 
-    # ▶ FeatureGroup 분리: 정류장(회색) / 경로·방문번호
     m = folium.Map(location=[ctr_lat, ctr_lon], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
     fg_stops  = folium.FeatureGroup(name="후보 정류장(회색)", show=True).add_to(m)
     fg_routes = folium.FeatureGroup(name="경로/방문순서", show=True).add_to(m)
 
-    # 회색 점(토글 대상)
     for _, r in cand_gdf.iterrows():
         folium.CircleMarker([r["lat"], r["lon"]], radius=4, color="#666", weight=1,
                             fill=True, fill_color="#777", fill_opacity=0.9,
@@ -307,21 +319,28 @@ with c3:
             if st.session_state["fleet"] > 1:
                 st.info(f"예상 총 소요시간 {total_min:.1f}분 → 차량 {st.session_state['fleet']}대 권장(1대당 {PER_VEHICLE_LIMIT_MIN:.0f}분 기준)")
 
-    # ▶ 버튼(체크박스) 추가: 위 지도에서도 레이어 ON/OFF 가능
     folium.LayerControl(collapsed=True).add_to(m)
-
     st_folium(m, height=510, returned_objects=[], use_container_width=True, key="routing_map")
 
-# ===================== 커버리지 비교 =====================
-st.markdown('<div class="section">🗺️ 커버리지 비교 (반경 100m · 전체 기준)</div>', unsafe_allow_html=True)
+# ===================== 커버리지 비교(아래 지도) =====================
+st.markdown('<div class="section">🗺️ 커버리지 비교 (전체 기준)</div>', unsafe_allow_html=True)
 
-radius_m = st.slider("커버리지 반경(미터)", min_value=50, max_value=300, value=100, step=10)
+cover_mode = st.radio("커버 산정 방식", ["버퍼 합집합(반경 r)", "컨벡스 헐(최대 외피)"], horizontal=True, index=0)
+if cover_mode.startswith("버퍼"):
+    radius_m = st.slider("커버리지 반경(미터)", min_value=50, max_value=300, value=100, step=10)
+else:
+    radius_m = 100  # 값은 사용 안하지만 함수 시그니처 맞춤
+    st.caption("※ 컨벡스 헐은 반경을 사용하지 않습니다. 모든 점을 감싸는 최소 볼록 다각형을 사용합니다.")
 
 exist_pts = existing_gdf[["name","lon","lat","geometry"]].copy()
 cand_pts  = cand_gdf[["name","lon","lat","geometry"]].copy()
+both_pts  = pd.concat([exist_pts, cand_pts], ignore_index=True)
 
-base_poly, base_km2 = coverage_union_and_area(exist_pts, radius_m=radius_m)
-prop_poly, prop_km2 = coverage_union_and_area(pd.concat([exist_pts, cand_pts], ignore_index=True), radius_m=radius_m)
+mode_key = "buffer" if cover_mode.startswith("버퍼") else "hull"
+
+base_poly, base_km2 = coverage_region(exist_pts, mode=mode_key, radius_m=radius_m)
+prop_poly, prop_km2 = coverage_region(both_pts,  mode=mode_key, radius_m=radius_m)
+
 delta_area = prop_km2 - base_km2
 inc_rate   = (delta_area / base_km2 * 100) if base_km2 > 0 else (100.0 if prop_km2 > 0 else 0.0)
 
@@ -331,8 +350,8 @@ mc2.metric("제안(기존+추가) 면적", f"{prop_km2:.3f} km²")
 mc3.metric("면적 증가", f"{delta_area:+.3f} km²")
 mc4.metric("증가율", f"{inc_rate:+.1f}%")
 
-ctr_lat2 = float(pd.concat([exist_pts["lat"], cand_pts["lat"]]).mean())
-ctr_lon2 = float(pd.concat([exist_pts["lon"], cand_pts["lon"]]).mean())
+ctr_lat2 = float(both_pts["lat"].mean())
+ctr_lon2 = float(both_pts["lon"].mean())
 if math.isnan(ctr_lat2) or math.isnan(ctr_lon2): ctr_lat2, ctr_lon2 = 36.80, 127.15
 
 m2 = folium.Map(location=[ctr_lat2, ctr_lon2], zoom_start=12, tiles="CartoDB Positron", control_scale=True)
@@ -347,12 +366,15 @@ for _, r in cand_pts.iterrows():
     folium.CircleMarker([r["lat"], r["lon"]], radius=5, color="#1e3a8a", fill=True, fill_color="#3b82f6",
                         fill_opacity=0.9, tooltip=f"[후보] {r['name']}").add_to(fg_cand)
 
+style_exist = {"color":"#ef4444","fillColor":"#ef4444","fillOpacity":0.12,"weight":2}
+style_prop  = {"color":"#10b981","fillColor":"#10b981","fillOpacity":0.18,"weight":2}
+
 if not base_poly.empty:
-    folium.GeoJson(base_poly.__geo_interface__, name="기존 커버",
-                   style_function=lambda x: {"color":"#ef4444","fillColor":"#ef4444","fillOpacity":0.15,"weight":2}).add_to(m2)
+    folium.GeoJson(base_poly.__geo_interface__, name=("기존 커버(버퍼)" if mode_key=="buffer" else "기존 커버(헐)"),
+                   style_function=lambda x: style_exist).add_to(m2)
 if not prop_poly.empty:
-    folium.GeoJson(prop_poly.__geo_interface__, name="제안 커버",
-                   style_function=lambda x: {"color":"#10b981","fillColor":"#10b981","fillOpacity":0.15,"weight":2}).add_to(m2)
+    folium.GeoJson(prop_poly.__geo_interface__, name=("제안 커버(버퍼)" if mode_key=="buffer" else "제안 커버(헐)"),
+                   style_function=lambda x: style_prop).add_to(m2)
 
 folium.LayerControl(collapsed=True).add_to(m2)
 st_folium(m2, height=560, returned_objects=[], use_container_width=True, key="coverage_map_all")
